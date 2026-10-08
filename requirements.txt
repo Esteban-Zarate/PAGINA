@@ -1,0 +1,27 @@
+# ── Core Streamlit (versión compatible con starlette y uvicorn) ──────────────
+streamlit==1.41.0
+streamlit-autorefresh==1.0.1
+
+# ── Dependencias web (versiones compatibles entre sí) ────────────────────────
+starlette==0.41.3
+uvicorn==0.32.1
+
+# ── Datos y análisis ─────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+
+# ── Exportación de archivos ───────────────────────────────────────────────────
+reportlab>=4.0.0
+openpyxl>=3.1.0
+python-docx>=1.1.0
+svglib>=2.2.0
+pypdf 
+
+# ── Utilidades ────────────────────────────────────────────────────────────────
+Pillow>=10.0.0
+yagmail
+psycopg2-binary
+
+
+# IA opcional para EcoBot Solar (si se configura OPENAI_API_KEY)
+openai>=1.40.0

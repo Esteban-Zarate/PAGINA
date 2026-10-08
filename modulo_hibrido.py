@@ -1,0 +1,2537 @@
+# modulo_hibrido.py — Calculadora Solar · Sistema Fotovoltaico HÍBRIDO
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+Dimensionamiento de sistema fotovoltaico HÍBRIDO:
+  • Combina generación solar (ON-GRID) + banco de baterías (OFF-GRID backup)
+  • Inversor híbrido con MPPT integrado + cargador de baterías
+  • Operación en 4 modos: Solar puro, Solar+Red, Solar+Batería, Red+Batería
+  • Análisis de autonomía, autoconsumo, inyección y payback
+  • Planos: distribución paneles + diagrama unifilar HÍBRIDO
+"""
+
+import streamlit as st
+import sqlite3
+import pandas as pd
+import math
+import os
+import io
+import tempfile
+import pathlib
+from datetime import datetime
+import base64
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                 Paragraph, Spacer, HRFlowable)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+
+# ─── Módulo de cableado ──────────────────────────────────────────────────────
+try:
+    from modulo_cableado import mostrar_cableado as _mostrar_cableado_hib
+    from modulo_cableado import generar_pdf_cableado as _generar_pdf_cableado_hib
+    _CABLEADO_DISPONIBLE = True
+except ImportError:
+    _CABLEADO_DISPONIBLE = False
+
+# ─── Módulo de informe completo (consolidado PDF de soporte) ────────────────
+try:
+    from modulo_informe import svg_a_pdf_bytes, combinar_pdfs, pagina_portada
+    _INFORME_COMPLETO_HIB = True
+    _INFORME_COMPLETO_HIB_ERROR = None
+except Exception as _e_inf_hib:
+    _INFORME_COMPLETO_HIB = False
+    _INFORME_COMPLETO_HIB_ERROR = f"{type(_e_inf_hib).__name__}: {_e_inf_hib}"
+
+# ─── DB ───────────────────────────────────────────────────────────────────────
+def _db_path() -> str:
+    env = os.environ.get("SOLARCALC_DB_PATH")
+    if env:
+        return env
+    script_dir = pathlib.Path(__file__).parent.resolve()
+    candidate = script_dir / "solar_calc.db"
+    try:
+        t = script_dir / ".wt"; t.touch(); t.unlink()
+        return str(candidate)
+    except Exception:
+        return str(pathlib.Path(tempfile.gettempdir()) / "solar_calc.db")
+
+DB_PATH = _db_path()
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# ─── HELPERS SVG ──────────────────────────────────────────────────────────────
+def _sv(v, d="—"):  return str(v) if v else d
+def _se(v, d=""):
+    if not v: return d
+    return str(v).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"','&quot;')
+
+def render_svg_hib(svg_string: str, height: int = 700) -> None:
+    b64 = base64.b64encode(svg_string.encode("utf-8")).decode("utf-8")
+    html = (f'<div style="width:100%;border-radius:12px;overflow:hidden;">'
+            f'<img src="data:image/svg+xml;base64,{b64}" '
+            f'style="width:100%;height:{height}px;object-fit:contain;'
+            f'background:#0A0E1A;border-radius:12px;" alt="Plano Híbrido"/></div>')
+    st.markdown(html, unsafe_allow_html=True)
+
+# ─── CÁLCULOS HÍBRIDO ────────────────────────────────────────────────────────
+def calcular_hibrido(consumo_wh_dia: float, hsp: float, pot_panel_wp: int,
+                     dias_autonomia: float, dod: float, v_bat: float,
+                     cap_bat_ah: float, tarifa_kwh: float,
+                     v_mppt_min: float, v_mppt_max: float,
+                     voc_panel: float, vmpp_panel: float, impp_panel: float,
+                     pr: float = 0.80, factor_hibrido: float = 1.20,
+                     eficiencia: float = 0.90,
+                     porcentaje_respaldo: float = 0.70) -> dict:
+    """Cálculo completo del sistema híbrido — Metodología PDF RETIE.
+    Paneles: Ed = consumo × porcentaje_respaldo → E_real = Ed/FP → P_FV = E_real/HSP
+    porcentaje_respaldo: fracción del consumo a cubrir con solar (PDF ejemplo: 0.70 = 70%)
+    La red eléctrica cubre el resto; las baterías dan autonomía nocturna configurable.
+    eficiencia: eficiencia global del sistema (inversor + cables + autodescarga).
+    """
+
+    # ── 1. Banco de baterías
+    consumo_fs       = consumo_wh_dia * 1.20
+    consumo_kwh_dia  = consumo_wh_dia / 1000.0
+    consumo_h_kwh    = consumo_kwh_dia / 24.0
+    horas_autonomia_h = dias_autonomia * 24.0
+    e_autonomia_kwh  = consumo_h_kwh * horas_autonomia_h
+    # Cap banco: E_autonomia / (DoD × η)
+    cap_banco_kwh    = e_autonomia_kwh / ((dod / 100) * max(eficiencia, 0.01))
+    cap_bat_total_ah = cap_banco_kwh * 1000 / v_bat
+    n_baterias       = math.ceil(cap_bat_total_ah / cap_bat_ah)
+    if n_baterias % 2 != 0 and n_baterias > 1:
+        n_baterias += 1
+    cap_real_wh      = n_baterias * cap_bat_ah * v_bat
+    cap_real_kwh     = cap_real_wh / 1000.0
+    autonomia_real_h = cap_real_wh * (dod / 100) * eficiencia / max(consumo_h_kwh, 0.001)
+    energia_util_kwh = cap_real_kwh * (dod / 100) * eficiencia
+
+    # ── 2. Array FV — Metodología PDF Híbrido
+    # Ed = consumo × porcentaje_respaldo  (no se suma recarga del banco)
+    # La red eléctrica cubre el resto; las baterías solo dan autonomía nocturna
+    e_parcial_kwh    = consumo_kwh_dia * max(0.01, min(porcentaje_respaldo, 1.0))  # ① Ed
+    e_real_kwh       = e_parcial_kwh / max(pr, 0.01)                              # ② E_real = Ed/FP
+    pot_array_wp_min = (e_real_kwh / max(hsp, 0.01)) * 1000                       # ③ P_FV
+    n_paneles        = math.ceil(pot_array_wp_min / pot_panel_wp)                  # ④ N mínimo
+    pot_instalada_wp = n_paneles * pot_panel_wp
+    e_panel_wh       = pot_panel_wp * hsp * pr                                     # ⑤ prod. por panel
+    gen_dia_kwh      = (pot_instalada_wp / 1000) * hsp * pr
+
+    # ── Configuración strings (MPPT)
+    pan_serie_min      = max(1, math.ceil(v_mppt_min / vmpp_panel)) if vmpp_panel > 0 else 1
+    pan_serie_max_mppt = math.floor(v_mppt_max / vmpp_panel)         if vmpp_panel > 0 else 20
+    pan_serie_max_voc  = math.floor((v_mppt_max * 1.15) / voc_panel) if voc_panel  > 0 else 20
+    pan_serie_max      = max(min(pan_serie_max_mppt, pan_serie_max_voc), pan_serie_min)
+    # Buscar combinación serie×paralelo que más se acerque a n_paneles
+    pan_serie = 1; n_strings = n_paneles; best_extra = 10_000
+    for s in range(pan_serie_min, pan_serie_max + 1):
+        p = math.ceil(n_paneles / s); total = s * p; extra = total - n_paneles
+        if extra < best_extra or (extra == best_extra and abs(s-p) < abs(pan_serie-n_strings)):
+            best_extra = extra; pan_serie = s; n_strings = p
+    if pan_serie_min > n_paneles: pan_serie = n_paneles; n_strings = 1
+    n_paneles_real = pan_serie * n_strings
+    pot_inst_real  = n_paneles_real * pot_panel_wp
+    v_str_mpp      = pan_serie * vmpp_panel
+    v_str_oc       = pan_serie * voc_panel
+    i_array        = impp_panel * n_strings
+
+    # ── Inversor híbrido
+    consumo_dia_kwh     = consumo_wh_dia / 1000
+    autoconsumo_kwh     = min(gen_dia_kwh, consumo_dia_kwh)
+    excedente_kwh       = max(0, gen_dia_kwh - consumo_dia_kwh)
+    deficit_kwh         = max(0, consumo_dia_kwh - gen_dia_kwh)
+    autoconsumo_pct     = (autoconsumo_kwh / consumo_dia_kwh * 100) if consumo_dia_kwh > 0 else 0
+    # El excedente va primero a cargar baterías, luego inyecta a la red
+    excedente_bat_kwh   = min(excedente_kwh, cap_real_wh * 0.3 / 1000)  # 30% cap diaria batería
+    inyeccion_kwh       = max(0, excedente_kwh - excedente_bat_kwh)
+
+    # Inversor híbrido: potencia de campo FV × FM 25% → tamaño comercial
+    # (en híbrido el inversor debe manejar la potencia pico del array, no solo el consumo)
+    _KW_COM_H = [0.5, 1, 1.5, 2, 3, 3.5, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50]
+    _inv_w_h = pot_inst_real * 1.25
+    pot_inv_kw = float(next((k for k in _KW_COM_H if k*1000 >= _inv_w_h),
+                            math.ceil(_inv_w_h/1000)))
+
+    # ── Generación anual
+    gen_anio_kwh        = gen_dia_kwh * 365
+    co2_anio_kg         = gen_anio_kwh * 0.126
+
+    return {
+        "consumo_fs":        consumo_fs,
+        "pot_array_min":     pot_array_wp_min,
+        "n_paneles":         n_paneles_real,
+        "pan_serie":         pan_serie,
+        "n_strings":         n_strings,
+        "pot_inst":          pot_inst_real,
+        "gen_dia_kwh":       gen_dia_kwh,
+        "gen_anio_kwh":      gen_anio_kwh,
+        "v_str_mpp":         v_str_mpp,
+        "v_str_oc":          v_str_oc,
+        "i_array":           i_array,
+        "n_baterias":        n_baterias,
+        "cap_bat_total_wh":  cap_real_wh,
+        "cap_bat_total_ah":  n_baterias * cap_bat_ah,
+        "cap_real_kwh":      cap_real_kwh,
+        "energia_util_kwh":  energia_util_kwh,
+        "autonomia_real_h":  autonomia_real_h,
+        "autonomia_real_d":  autonomia_real_h / 24,
+        "eficiencia":        eficiencia,
+        "autoconsumo_kwh":   autoconsumo_kwh,
+        "inyeccion_kwh":     inyeccion_kwh,
+        "deficit_kwh":       deficit_kwh,
+        "autoconsumo_pct":   autoconsumo_pct,
+        "excedente_bat_kwh": excedente_bat_kwh,
+        "pot_inv_kw":        pot_inv_kw,
+        "co2_anio_kg":       co2_anio_kg,
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SVG PLANO 1 — DISTRIBUCIÓN DE PANELES (HÍBRIDO)
+# ═══════════════════════════════════════════════════════════════════════════════
+def svg_plano_paneles_hib(n_paneles: int, pan_serie: int, n_strings: int,
+                           pot_panel: int, n_baterias: int, proyecto_info=None) -> str:
+    W, H = 1100, 700
+    C_BG   = "#0A0E1A"
+    C_SOL  = "#FFB300"
+    C_DC   = "#00BCD4"
+    C_BAT  = "#A78BFA"   # violeta = baterías
+    C_GRID = "#FF6B35"
+    C_AC   = "#00E676"
+    C_DIM  = "#8A9BBD"
+    C_TEXT = "#E8EDF5"
+    C_PAN  = "#1A2235"
+    C_HIB  = "#F59E0B"   # ámbar híbrido
+
+    def box(x,y,w,h,fill,stroke,rx=4,sw=1):
+        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="{stroke}" stroke-width="{sw}" rx="{rx}"/>'
+    def txt(x,y,t,sz=9,fill=C_TEXT,anchor="middle",weight="normal",font="Barlow,sans-serif"):
+        return f'<text x="{x}" y="{y}" font-family="{font}" font-size="{sz}" fill="{fill}" text-anchor="{anchor}" font-weight="{weight}">{_se(t)}</text>'
+    def line(x1,y1,x2,y2,stroke=C_DC,sw=1.5,dash=""):
+        d=f' stroke-dasharray="{dash}"' if dash else ""
+        return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{stroke}" stroke-width="{sw}"{d}/>'
+
+    # Paleta de strings
+    STR_COLORS = [C_DC,"#FFB300","#00E676","#FF5252","#A78BFA","#F472B6","#34D399","#FB923C"]
+    PW, PH, GX, GY = 50, 30, 5, 5
+    MX, MY = 55, 95
+
+    max_cols = min(pan_serie, 18)
+    max_rows = math.ceil(n_paneles / max_cols)
+
+    panels_svg = ""
+    pan_count  = 0
+    for row in range(max_rows):
+        for col in range(max_cols):
+            if pan_count >= n_paneles: break
+            sc  = STR_COLORS[row % len(STR_COLORS)]
+            px  = MX + col * (PW + GX)
+            py  = MY + row * (PH + GY)
+            panels_svg += box(px, py, PW, PH, C_PAN, sc, 3)
+            for lx in range(1,4):
+                panels_svg += line(px+lx*PW//4, py+2, px+lx*PW//4, py+PH-2, "#2A3A55", 0.4)
+            for ly in range(1,3):
+                panels_svg += line(px+2, py+ly*PH//3, px+PW-2, py+ly*PH//3, "#2A3A55", 0.4)
+            panels_svg += txt(px+PW//2, py+PH//2+3, str(pan_count+1), 6, sc, "middle","600","Share Tech Mono,monospace")
+            pan_count += 1
+
+    # Etiquetas strings
+    str_labels = ""
+    for s in range(n_strings):
+        sc = STR_COLORS[s % len(STR_COLORS)]
+        sy = MY + s*(PH+GY) + PH//2 + 3
+        str_labels += txt(MX-8, sy, f"S{s+1}", 7, sc, "end","700","Share Tech Mono,monospace")
+
+    # Dimensiones
+    arr_w_m = max_cols * 1.134
+    arr_h_m = max_rows * 0.686
+    arr_w_px = max_cols * (PW+GX)
+    arr_h_px = max_rows * (PH+GY)
+    dim_y = MY + arr_h_px + 18
+    dims  = f'''
+    {line(MX,dim_y,MX+arr_w_px-GX,dim_y,C_DIM,1)}
+    {line(MX,dim_y-4,MX,dim_y+4,C_DIM,1)}
+    {line(MX+arr_w_px-GX,dim_y-4,MX+arr_w_px-GX,dim_y+4,C_DIM,1)}
+    {txt((MX*2+arr_w_px-GX)//2,dim_y+11,f"↔ {arr_w_m:.2f} m  ({max_cols} paneles/string)",8,C_DIM)}
+    {line(MX-22,MY,MX-22,MY+arr_h_px-GY,C_DIM,1)}
+    {line(MX-26,MY,MX-18,MY,C_DIM,1)}
+    {line(MX-26,MY+arr_h_px-GY,MX-18,MY+arr_h_px-GY,C_DIM,1)}
+    {txt(MX-24,MY+arr_h_px//2,f"{arr_h_m:.2f}m",7.5,C_DIM,"end")}
+    '''
+
+    # Panel info lateral
+    IX = max(MX + arr_w_px + 40, 790)
+    IY = 75; IW = W - IX - 20
+    if IW < 150: IW = 175; IX = W - IW - 18
+    pot_inst = n_paneles * pot_panel
+    items = [
+        ("Sistema",        "HÍBRIDO ON+OFF",        C_HIB),
+        ("Paneles",        f"{n_paneles} × {pot_panel} Wp", C_SOL),
+        ("kWp instalado",  f"{pot_inst/1000:.2f} kWp", C_SOL),
+        ("Config. array",  f"{pan_serie}S × {n_strings}P", C_DC),
+        ("Baterías",       f"{n_baterias} unidades",  C_BAT),
+        ("Área array",     f"≈{arr_w_m:.1f}×{arr_h_m:.1f} m", C_DIM),
+        ("Sup. total",     f"≈{arr_w_m*arr_h_m:.1f} m²", C_DIM),
+    ]
+    info  = box(IX,IY,IW,20+len(items)*23+8,"#0F1525","#2A3A55",8)
+    info += box(IX,IY,IW,20,C_HIB,C_HIB,8)
+    info += txt(IX+IW//2,IY+13,"DATOS ARRAY HÍBRIDO",8,"#0A0E1A","middle","700","Rajdhani,sans-serif")
+    for k,(lbl,val,col) in enumerate(items):
+        iy2 = IY+28+k*23
+        info += txt(IX+8,iy2+7,lbl,7.5,C_DIM,"start")
+        info += txt(IX+IW-8,iy2+7,val,7.5,col,"end","600","Share Tech Mono,monospace")
+        if k < len(items)-1:
+            info += line(IX+6,iy2+14,IX+IW-6,iy2+14,"#1A2235",0.5)
+
+    # Leyenda strings
+    leg_x = IX; leg_y = IY+30+len(items)*23+20
+    leg_items = [(STR_COLORS[i%len(STR_COLORS)],f"String {i+1} ({pan_serie} pan.)") for i in range(min(n_strings,6))]
+    legend  = box(leg_x,leg_y,IW,18+len(leg_items)*18+8,"#0F1525","#2A3A55",6)
+    legend += txt(leg_x+IW//2,leg_y+12,"LEYENDA STRINGS",7.5,C_DIM,"middle","700")
+    for k,(sc,lb) in enumerate(leg_items):
+        ly2 = leg_y+22+k*18
+        legend += box(leg_x+8,ly2,12,10,sc,sc,2)
+        legend += txt(leg_x+26,ly2+8,lb,7.5,C_TEXT,"start")
+
+    # Baterías miniatura (panel inferior)
+    bat_y0 = min(MY+arr_h_px+50, H-160)
+    bat_count_show = min(n_baterias, 12)
+    bat_w, bat_h, bat_gap = 34, 22, 6
+    bat_svg = ""
+    for bi in range(bat_count_show):
+        bx = MX + bi*(bat_w+bat_gap)
+        bat_svg += box(bx,bat_y0,bat_w,bat_h,"#1A2235",C_BAT,3)
+        bat_svg += box(bx+bat_w,bat_y0+bat_h//2-4,4,8,C_BAT,C_BAT,1)   # polo +
+        bat_svg += txt(bx+bat_w//2,bat_y0+bat_h//2+4,f"B{bi+1}",6,C_BAT,"middle","600","Share Tech Mono,monospace")
+    if n_baterias > 12:
+        bat_svg += txt(MX+12*(bat_w+bat_gap)+10,bat_y0+bat_h//2+4,f"+{n_baterias-12}",8,C_DIM,"start")
+    bat_svg += txt(MX,bat_y0-10,f"BANCO DE BATERÍAS — {n_baterias} UNIDADES",8,C_BAT,"start","600","Rajdhani,sans-serif")
+
+    proy = _se(proyecto_info[1] if proyecto_info else None,"Proyecto")
+    mun  = _se(proyecto_info[2] if proyecto_info else None,"—")
+
+    # Header
+    header = f'''
+    <rect x="0" y="0" width="{W}" height="60" fill="#0F1525"/>
+    <line x1="0" y1="60" x2="{W}" y2="60" stroke="{C_HIB}" stroke-width="1.5"/>
+    <text x="20" y="22" font-family="Rajdhani,sans-serif" font-size="18" fill="{C_SOL}" font-weight="700" letter-spacing="2">☀ CALCULADORA SOLAR</text>
+    <text x="20" y="38" font-family="Barlow,sans-serif" font-size="9" fill="{C_DIM}" letter-spacing="3">SISTEMA FOTOVOLTAICO HÍBRIDO — ON-GRID + RESPALDO EN BATERÍAS</text>
+    <text x="20" y="52" font-family="Share Tech Mono,monospace" font-size="8" fill="#2A3A55">DISTRIBUCIÓN FÍSICA DE PANELES  ·  VISTA EN PLANTA</text>
+    <rect x="{W-230}" y="8" width="220" height="46" rx="6" fill="#1A2235" stroke="{C_HIB}" stroke-width="1"/>
+    <text x="{W-120}" y="25" text-anchor="middle" font-family="Rajdhani,sans-serif" font-size="10" fill="{C_HIB}" font-weight="700">☀ ON-GRID + 🔋 BATERÍA</text>
+    <text x="{W-120}" y="39" text-anchor="middle" font-family="Share Tech Mono,monospace" font-size="8" fill="{C_DIM}">Inversor Híbrido MPPT</text>
+    <text x="{W-120}" y="51" text-anchor="middle" font-family="Share Tech Mono,monospace" font-size="8" fill="{C_DIM}">220V AC  60Hz</text>
+    '''
+
+    # Title block
+    tb_y = H - 65
+    title = f'''
+    <rect x="0" y="{tb_y}" width="{W}" height="65" fill="#0F1525" stroke="#2A3A55" stroke-width="0.8"/>
+    <line x1="0" y1="{tb_y}" x2="{W}" y2="{tb_y}" stroke="{C_HIB}" stroke-width="1.5"/>
+    <text x="12" y="{tb_y+16}" font-family="Rajdhani,sans-serif" font-size="12" fill="{C_HIB}" font-weight="700">
+        ☀ PLANO DISTRIBUCIÓN PANELES — SISTEMA FOTOVOLTAICO HÍBRIDO (ON-GRID + BATERÍAS)</text>
+    <text x="12" y="{tb_y+30}" font-family="Rajdhani,sans-serif" font-size="9" fill="{C_TEXT}">
+        Proyecto: {proy}  |  Municipio: {mun}  |  Config: {pan_serie}S×{n_strings}P  |  Baterías: {n_baterias} ud.</text>
+    <text x="12" y="{tb_y+44}" font-family="Share Tech Mono,monospace" font-size="8" fill="{C_DIM}">
+        Pot. instalada: {pot_inst/1000:.2f} kWp  |  Área: {arr_w_m:.2f}m × {arr_h_m:.2f}m  |  Calculadora Solar HÍBRIDO  |  {datetime.now().strftime("%d/%m/%Y")}  |  Plano N°01</text>
+    <text x="{W-12}" y="{tb_y+16}" text-anchor="end" font-family="Share Tech Mono,monospace" font-size="9" fill="{C_DIM}">N°01  Rev.A</text>
+    '''
+
+    return f'''<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"
+         style="background:{C_BG};border-radius:12px;width:100%;max-height:720px;">
+      <defs>
+        <pattern id="grid_h1" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#12192B" stroke-width="0.3"/>
+        </pattern>
+      </defs>
+      <rect width="{W}" height="{H-65}" fill="url(#grid_h1)"/>
+      {header}{panels_svg}{str_labels}{dims}{info}{legend}{bat_svg}{title}
+    </svg>'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SVG PLANO 2 — DIAGRAMA UNIFILAR HÍBRIDO
+# ═══════════════════════════════════════════════════════════════════════════════
+def svg_unifilar_hibrido(n_paneles: int, pan_serie: int, n_strings: int,
+                          pot_panel: int, pot_inv_kw: float,
+                          v_str_mpp: float, v_str_oc: float, i_array: float,
+                          n_baterias: int, v_bat: float, cap_bat_ah: float,
+                          consumo_fs_wh: float, hsp: float,
+                          proyecto_info=None, cargas_df=None) -> str:
+    W, H   = 1290, 700
+    C_BG   = "#0A0E1A"
+    C_SOL  = "#FFB300"
+    C_DC   = "#00BCD4"
+    C_AC   = "#00E676"
+    C_BAT  = "#A78BFA"
+    C_GRID = "#FF6B35"
+    C_HIB  = "#F59E0B"
+    C_DIM  = "#8A9BBD"
+    C_TEXT = "#E8EDF5"
+    C_NEG  = "#FF5252"
+    C_GND  = "#556"
+
+    def box(x,y,w,h,fill,stroke,rx=4,sw=1):
+        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="{stroke}" stroke-width="{sw}" rx="{rx}"/>'
+    def txt(x,y,t,sz=9,fill=C_TEXT,anchor="middle",weight="normal",font="Barlow,sans-serif"):
+        return f'<text x="{x}" y="{y}" font-family="{font}" font-size="{sz}" fill="{fill}" text-anchor="{anchor}" font-weight="{weight}">{_se(t)}</text>'
+    def line(x1,y1,x2,y2,stroke=C_DC,sw=2,dash=""):
+        d=f' stroke-dasharray="{dash}"' if dash else ""
+        return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{stroke}" stroke-width="{sw}"{d}/>'
+    def wlbl(x,y,t,col=C_DC):
+        return f'<text x="{x}" y="{y}" font-family="Share Tech Mono,monospace" font-size="7" fill="{col}" text-anchor="start">{_se(t)}</text>'
+
+    pot_inst = n_paneles * pot_panel
+    cap_bat_total_wh = n_baterias * v_bat * cap_bat_ah
+
+    proy = _se(proyecto_info[1] if proyecto_info else None,"Proyecto")
+    mun  = _se(proyecto_info[2] if proyecto_info else None,"—")
+
+    # ── 1. ARRAY FV ──────────────────────────────────────────────────────────
+    AX,AY,AW,AH = 20,120,125,210
+    arr = f'''<g>
+      {box(AX,AY,AW,AH,"#0F1525","#FFB300",8)}
+      {box(AX,AY,AW,22,"#1A2235","#FFB300",8)}
+      {txt(AX+AW//2,AY+14,"ARRAY FV",7.5,C_SOL,"middle","700","Rajdhani,sans-serif")}
+      {txt(AX+AW//2,AY+32,f"{n_paneles}×{pot_panel}Wp",9,C_SOL,"middle","700","Share Tech Mono,monospace")}
+      {txt(AX+AW//2,AY+46,f"{pot_inst/1000:.2f} kWp",8,C_DIM)}'''
+    # Mini strings
+    spx=AX+10; spy=AY+60; spw=20; sph=13; spg=4
+    for s in range(min(n_strings,4)):
+        arr += box(spx,spy+s*(sph+spg),spw,sph,"#1E2A3F",C_DC,2)
+        arr += txt(spx+spw//2,spy+s*(sph+spg)+sph//2+3,f"S{s+1}",6,C_DC)
+    if n_strings>4:
+        arr += txt(spx+spw//2,spy+4*(sph+spg)+5,f"+{n_strings-4}",6.5,C_DIM)
+    arr += txt(spx+spw+8,spy+2*(sph+spg)+6,f"{pan_serie}S",7,C_DIM,"start")
+    arr += txt(AX+AW//2,AY+AH-28,f"Vmpp={v_str_mpp:.0f}V",7,C_DC,"middle","normal","Share Tech Mono,monospace")
+    arr += txt(AX+AW//2,AY+AH-16,f"I={i_array:.1f}A",7,C_DIM,"middle","normal","Share Tech Mono,monospace")
+    arr += "</g>"
+
+    # ── 2. CAJA COMBINADORA DC ───────────────────────────────────────────────
+    CBX,CBY,CBW,CBH = 200,158,85,130
+    cb = f'''<g>
+      {box(CBX,CBY,CBW,CBH,"#0F1525","#00BCD4",6)}
+      {box(CBX,CBY,CBW,20,"#1A2235","#00BCD4",6)}
+      {txt(CBX+CBW//2,CBY+13,"CAJA DC",7,C_DC,"middle","700","Rajdhani,sans-serif")}
+      {txt(CBX+CBW//2,CBY+32,"Combiner",7.5,C_TEXT)}
+      {txt(CBX+CBW//2,CBY+46,f"{n_strings} strings",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+      {box(CBX+8,CBY+58,CBW-16,18,"#1E2A3F","#FF5252",3)}
+      {txt(CBX+CBW//2,CBY+70,"Fusibles DC",7,"#FF5252")}
+      {box(CBX+8,CBY+80,CBW-16,18,"#1E2A3F","#8A9BBD",3)}
+      {txt(CBX+CBW//2,CBY+92,"Secc. DC",7,C_DIM)}
+      {box(CBX+8,CBY+102,CBW-16,18,"#1E2A3F","#FF5252",3)}
+      {txt(CBX+CBW//2,CBY+114,"SPD DC",7,"#FF5252")}
+    </g>'''
+
+    # ── 3. INVERSOR HÍBRIDO (pieza central) ──────────────────────────────────
+    INX,INY,INW,INH = 345,95,160,260
+    inv = f'''<g>
+      {box(INX,INY,INW,INH,"#0F1525",C_HIB,8,2)}
+      {box(INX,INY,INW,24,"#1A2235",C_HIB,8)}
+      {txt(INX+INW//2,INY+15,"INVERSOR HÍBRIDO",8.5,C_HIB,"middle","700","Rajdhani,sans-serif")}
+      {txt(INX+INW//2,INY+40,f"{pot_inv_kw:.1f} kW",20,C_HIB,"middle","700","Rajdhani,sans-serif")}
+      {txt(INX+INW//2,INY+60,"Grid-Tie + Charger",8,C_DIM)}
+      {box(INX+10,INY+70,INW-20,20,"#1E2A3F",C_DC,3)}
+      {txt(INX+INW//2,INY+83,"MPPT integrado",7.5,C_DC)}
+      {box(INX+10,INY+94,INW-20,20,"#1E2A3F",C_SOL,3)}
+      {txt(INX+INW//2,INY+107,f"Rango: {v_str_mpp:.0f}–{v_str_oc:.0f}V",7,C_SOL,"middle","normal","Share Tech Mono,monospace")}
+      {box(INX+10,INY+118,INW-20,20,"#1E2A3F",C_BAT,3)}
+      {txt(INX+INW//2,INY+131,"Charger baterías",7.5,C_BAT)}
+      {box(INX+10,INY+142,INW-20,20,"#1E2A3F",C_AC,3)}
+      {txt(INX+INW//2,INY+155,"220V AC  60Hz",7.5,C_AC)}
+      {box(INX+10,INY+166,INW-20,20,"#1E2A3F","#8A9BBD",3)}
+      {txt(INX+INW//2,INY+179,"Anti-isla / EPS",7,C_DIM)}
+      {box(INX+10,INY+190,INW-20,20,"#1E2A3F",C_GRID,3)}
+      {txt(INX+INW//2,INY+203,"Monitoreo WiFi",7,C_GRID)}
+      {box(INX+10,INY+214,INW-20,20,"#1E2A3F","#2A3A55",3)}
+      {txt(INX+INW//2,INY+227,"4 modos operación",7,C_DIM)}
+      {txt(INX+INW//2,INY+INH-10,"η≥97%  THD&lt;3%",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+    </g>'''
+
+    # ── 4. BANCO DE BATERÍAS ─────────────────────────────────────────────────
+    BAX,BAY,BAW,BAH = 200,340,240,140
+    bat = f'''<g>
+      {box(BAX,BAY,BAW,BAH,"#0F1525",C_BAT,8,1.5)}
+      {box(BAX,BAY,BAW,22,"#1A2235",C_BAT,8)}
+      {txt(BAX+BAW//2,BAY+14,"BANCO DE BATERÍAS",8,C_BAT,"middle","700","Rajdhani,sans-serif")}
+      {txt(BAX+BAW//2,BAY+34,f"{n_baterias} unidades",12,C_BAT,"middle","700","Share Tech Mono,monospace")}
+      {txt(BAX+BAW//2,BAY+50,f"{v_bat}V × {cap_bat_ah}Ah c/u",8,C_DIM)}
+      {txt(BAX+BAW//2,BAY+64,f"Cap. total: {n_baterias*v_bat*cap_bat_ah/1000:.1f} kWh",8,C_TEXT,"middle","600","Share Tech Mono,monospace")}
+      {box(BAX+10,BAY+74,BAW-20,18,"#1E2A3F",C_BAT,3)}
+      {txt(BAX+BAW//2,BAY+86,"BMS / Protección",7.5,C_BAT)}
+      {box(BAX+10,BAY+96,BAW-20,18,"#1E2A3F","#FF5252",3)}
+      {txt(BAX+BAW//2,BAY+108,"Fusible batería",7,"#FF5252")}
+      {txt(BAX+BAW//2,BAY+BAH-10,"LiFePO4 / AGM / GEL",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+    </g>'''
+    # Mini baterías
+    bb_w, bb_h, bb_g = 26, 14, 4
+    for bi in range(min(n_baterias,6)):
+        bx2 = BAX+10+bi*(bb_w+bb_g)
+        bat += box(bx2,BAY+30,bb_w,bb_h,"#1E2A3F",C_BAT,2)
+        bat += box(bx2+bb_w,BAY+30+bb_h//2-3,3,6,C_BAT,C_BAT,1)
+        bat += txt(bx2+bb_w//2,BAY+30+bb_h//2+4,f"{bi+1}",5.5,C_BAT,"middle","600","Share Tech Mono,monospace")
+    if n_baterias>6:
+        bat += txt(BAX+10+6*(bb_w+bb_g)+4,BAY+30+bb_h//2+4,f"...+{n_baterias-6}",7,C_DIM,"start")
+
+    # ── 5. MEDIDOR BIDIRECCIONAL ─────────────────────────────────────────────
+    MEX,MEY,MEW,MEH = 575,148,100,120
+    med = f'''<g>
+      {box(MEX,MEY,MEW,MEH,"#0F1525",C_GRID,6)}
+      {box(MEX,MEY,MEW,20,"#1A2235",C_GRID,6)}
+      {txt(MEX+MEW//2,MEY+13,"MEDIDOR BIDIRC.",7.5,C_GRID,"middle","700","Rajdhani,sans-serif")}
+      {txt(MEX+MEW//2,MEY+36,"📟",16)}
+      {txt(MEX+MEW//2,MEY+56,"Telemedida CREG",7,C_DIM)}
+      {txt(MEX+MEW//2,MEY+68,"Generación ↑",7,C_AC,"middle","normal","Share Tech Mono,monospace")}
+      {txt(MEX+MEW//2,MEY+80,"Consumo red ↓",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+      {txt(MEX+MEW//2,MEY+94,"220V / 60Hz",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+      {txt(MEX+MEW//2,MEY+MEH-10,"CREG 030-2018",6.5,C_GRID)}
+    </g>'''
+
+    # ── 6. TABLERO AC / CARGAS ───────────────────────────────────────────────
+    TAX,TAY,TAW,TAH = 575,315,100,130
+    tac = f'''<g>
+      {box(TAX,TAY,TAW,TAH,"#0F1525",C_AC,6)}
+      {box(TAX,TAY,TAW,20,"#1A2235",C_AC,6)}
+      {txt(TAX+TAW//2,TAY+13,"TABLERO AC",7.5,C_AC,"middle","700","Rajdhani,sans-serif")}
+      {box(TAX+8,TAY+28,TAW-16,18,"#1E2A3F",C_AC,3)}
+      {txt(TAX+TAW//2,TAY+40,"Interruptor gral.",7,C_AC)}
+      {box(TAX+8,TAY+50,TAW-16,18,"#1E2A3F","#FF5252",3)}
+      {txt(TAX+TAW//2,TAY+62,"Prot. diferencial",7,"#FF5252")}
+      {box(TAX+8,TAY+72,TAW-16,18,"#1E2A3F","#8A9BBD",3)}
+      {txt(TAX+TAW//2,TAY+84,"SPD AC",7,C_DIM)}
+      {txt(TAX+TAW//2,TAY+TAH-18,"CARGAS AC",8,C_AC,"middle","700")}
+      {txt(TAX+TAW//2,TAY+TAH-6,f"{consumo_fs_wh/1000:.1f} kWh/día",7,C_DIM,"middle","normal","Share Tech Mono,monospace")}
+    </g>'''
+
+    # ── 6b. CIRCUITOS RAMALES — inventario detallado de cargas ──────────────
+    CGX, CGY, CGW, CGH = 1070, 95, 200, 320
+    if cargas_df is not None and not cargas_df.empty:
+        _n_show8 = min(len(cargas_df), 9)
+        _sample8 = cargas_df.head(_n_show8)
+        cargas_items = ""
+        for _li8, (_, _lr8) in enumerate(_sample8.iterrows()):
+            _ly8 = CGY + 34 + _li8*24
+            _icon8 = "⚙" if int(_lr8.get("es_motor", 0) or 0) else "💡"
+            _name8 = str(_lr8["electrodomestico"])[:20].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            cargas_items += txt(CGX+14, _ly8+10, f"{_icon8} {_name8}", 7.5, C_TEXT, "start", "normal", "Barlow,sans-serif")
+            cargas_items += txt(CGX+CGW-12, _ly8+10, f"{int(_lr8['potencia_w'])}W", 7.5, C_DIM, "end", "normal", "Share Tech Mono,monospace")
+            cargas_items += line(CGX+8, _ly8+14, CGX+CGW-8, _ly8+14, "#1E2A3F", 0.6)
+        _extra8 = len(cargas_df) - _n_show8
+        if _extra8 > 0:
+            cargas_items += txt(CGX+CGW/2, CGY+34+_n_show8*24+10, f"+ {_extra8} equipos más", 7.5, C_DIM)
+        _total_w8 = int((cargas_df["cantidad"]*cargas_df["potencia_w"]).sum())
+    else:
+        cargas_items = (txt(CGX+CGW/2, CGY+60, "Sin inventario de cargas", 8, C_DIM)
+                         + txt(CGX+CGW/2, CGY+76, "capturado para este proyecto", 7.5, C_DIM)
+                         + txt(CGX+CGW/2, CGY+96, f"Consumo por recibo: {consumo_fs_wh/1000:.1f} kWh/día", 7.5, C_DC, "middle","normal","Share Tech Mono,monospace"))
+        _total_w8 = 0
+    cargas_detalle = f'''<g id="cargas_detalle">
+      {box(CGX,CGY,CGW,CGH,"#0F1525",C_AC,8)}
+      {box(CGX,CGY,CGW,22,"#1A2235",C_AC,8)}
+      {txt(CGX+CGW//2,CGY+14,"CIRCUITOS RAMALES (CARGAS)",7.5,C_AC,"middle","700","Rajdhani,sans-serif")}
+      {cargas_items}
+      {txt(CGX+CGW//2,CGY+CGH-12,f"Total: {_total_w8:,} W",8,C_AC,"middle","700","Share Tech Mono,monospace")}
+    </g>'''
+
+    # ── 7. RED ELÉCTRICA ─────────────────────────────────────────────────────
+    REX,REY,REW,REH = 745,148,110,100
+    red = f'''<g>
+      {box(REX,REY,REW,REH,"#0F1525",C_GRID,8,1.5)}
+      {box(REX,REY,REW,22,C_GRID,C_GRID,8)}
+      {txt(REX+REW//2,REY+14,"RED ELÉCTRICA",8,"#0A0E1A","middle","700","Rajdhani,sans-serif")}
+      {txt(REX+REW//2,REY+38,"⚡",22)}
+      {txt(REX+REW//2,REY+60,"220V AC · 60Hz",8,C_GRID,"middle","600","Share Tech Mono,monospace")}
+      {txt(REX+REW//2,REY+74,"Operador de red",7,C_DIM)}
+      {txt(REX+REW//2,REY+REH-10,"CREG / RETIE",7,C_DIM)}
+    </g>'''
+
+    # ── 8. MODOS DE OPERACIÓN ────────────────────────────────────────────────
+    MOX,MOY,MOW,MOH = 745,305,170,190
+    modos_items = [
+        ("Modo 1","☀ Solar → Cargas",      "#FFB300"),
+        ("Modo 2","☀+🔋 Solar+Bat→Cargas", "#A78BFA"),
+        ("Modo 3","☀→Red inyección",        "#FF6B35"),
+        ("Modo 4","Red→Bat carga nocturna", "#00BCD4"),
+    ]
+    modos = box(MOX,MOY,MOW,MOH,"#0F1525",C_HIB,6)
+    modos += box(MOX,MOY,MOW,20,"#1A2235",C_HIB,6)
+    modos += txt(MOX+MOW//2,MOY+13,"MODOS OPERACIÓN",7.5,C_HIB,"middle","700","Rajdhani,sans-serif")
+    for k,(m_lbl,m_txt,m_col) in enumerate(modos_items):
+        my2 = MOY+26+k*38
+        modos += box(MOX+8,my2,MOW-16,34,"#1E2A3F",m_col,4)
+        modos += txt(MOX+MOW//2,my2+12,m_lbl,7.5,m_col,"middle","700","Share Tech Mono,monospace")
+        modos += txt(MOX+MOW//2,my2+25,m_txt,7,C_TEXT)
+    modos += txt(MOX+MOW//2,MOY+MOH-8,"NTC 2050 / RETIE",6.5,C_DIM)
+
+    # ── CABLEO ────────────────────────────────────────────────────────────────
+    wires = f'''
+    <!-- Array → Combiner DC -->
+    {line(AX+AW,AY+AH*0.35,CBX,CBY+CBH*0.38,C_SOL,2.5)}
+    {line(AX+AW,AY+AH*0.65,CBX,CBY+CBH*0.65,C_NEG,2.5)}
+    {wlbl(AX+AW+3,AY+AH*0.35-4,f"+{v_str_mpp:.0f}V",C_SOL)}
+    {wlbl(AX+AW+3,AY+AH*0.65+9,"– GND",C_NEG)}
+    <!-- Combiner → Inversor híbrido DC -->
+    {line(CBX+CBW,CBY+CBH//2,INX,INY+INH*0.30,C_DC,2.5)}
+    {wlbl((CBX+CBW+INX)//2-10,CBY+CBH//2-6,f"DC {v_str_mpp:.0f}V / {i_array:.1f}A",C_DC)}
+    <!-- Inversor → Medidor AC -->
+    {line(INX+INW,INY+INH*0.38,MEX,MEY+MEH*0.48,C_AC,2.5)}
+    {wlbl((INX+INW+MEX)//2-15,INY+INH*0.38-6,"220V AC 60Hz",C_AC)}
+    <!-- Medidor → Red -->
+    {line(MEX+MEW,MEY+MEH//2,REX,REY+REH//2,C_GRID,2.5)}
+    {wlbl((MEX+MEW+REX)//2-25,MEY+MEH//2-6,"Inyección / Import.",C_GRID)}
+    <!-- Medidor → Tablero AC -->
+    {line(MEX+MEW//2,MEY+MEH,TAX+TAW//2,TAY,C_AC,2.5)}
+    {wlbl(MEX+MEW//2+4,(MEY+MEH+TAY)//2,"Autoconsumo",C_AC)}
+    <!-- Inversor → Baterías (bidireccional) -->
+    {line(INX+INW//2,INY+INH,BAX+BAW//2,BAY,C_BAT,2.5)}
+    {wlbl(INX+INW//2+4,(INY+INH+BAY)//2,f"DC {v_bat}V Bat.",C_BAT)}
+    <!-- Red → Medidor (importación) -->
+    {line(REX,REY+REH//2,MEX+MEW,MEY+MEH//2,C_GRID,1.5,"4,3")}
+    <!-- Tablero AC → Circuitos ramales (cargas) -->
+    {line(TAX+TAW,TAY+TAH*0.4,CGX,CGY+CGH*0.30,C_AC,2,"5,3")}
+    {wlbl((TAX+TAW+CGX)//2-30,TAY+TAH*0.4-6,"Circuitos ramales",C_AC)}
+    '''
+
+    # GND
+    GX2=INX+18; GY2=INY+INH+10
+    gnd = f'''<g>
+      {line(GX2,GY2,GX2,GY2+16,C_GND,1.5)}
+      {line(GX2-14,GY2+16,GX2+14,GY2+16,C_GND,2)}
+      {line(GX2-8,GY2+22,GX2+8,GY2+22,C_GND,1.5)}
+      {line(GX2-4,GY2+28,GX2+4,GY2+28,C_GND,1)}
+      {txt(GX2,GY2+38,"GND",7,C_GND)}
+    </g>'''
+
+    # Leyenda
+    leg2_x=890; leg2_y=330
+    leg2 = f'''<g>
+      {box(leg2_x,leg2_y,170,155,"#0F1525","#2A3A55",6)}
+      {txt(leg2_x+85,leg2_y+14,"REFERENCIAS",7.5,C_DIM,"middle","700")}
+      {line(leg2_x+10,leg2_y+28,leg2_x+42,leg2_y+28,C_SOL,2.5)}
+      {txt(leg2_x+48,leg2_y+32,"Cable DC Positivo",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+44,leg2_x+42,leg2_y+44,C_NEG,2.5)}
+      {txt(leg2_x+48,leg2_y+48,"Cable DC Negativo",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+60,leg2_x+42,leg2_y+60,C_AC,2.5)}
+      {txt(leg2_x+48,leg2_y+64,"Cable AC 220V",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+76,leg2_x+42,leg2_y+76,C_BAT,2.5)}
+      {txt(leg2_x+48,leg2_y+80,"Cable batería",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+92,leg2_x+42,leg2_y+92,C_GRID,2.5)}
+      {txt(leg2_x+48,leg2_y+96,"Red eléctrica",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+108,leg2_x+42,leg2_y+108,C_GND,1.5,"3,3")}
+      {txt(leg2_x+48,leg2_y+112,"Puesta a tierra",7.5,C_TEXT,"start")}
+      {line(leg2_x+10,leg2_y+124,leg2_x+42,leg2_y+124,C_GRID,1.5,"4,3")}
+      {txt(leg2_x+48,leg2_y+128,"Señal / importación",7.5,C_TEXT,"start")}
+      {txt(leg2_x+85,leg2_y+143,"NTC 2050 / RETIE",6.5,C_DIM)}
+    </g>'''
+
+    # Header
+    header = f'''
+    <rect x="0" y="0" width="{W}" height="60" fill="#0F1525"/>
+    <line x1="0" y1="60" x2="{W}" y2="60" stroke="{C_HIB}" stroke-width="1.5"/>
+    <text x="20" y="22" font-family="Rajdhani,sans-serif" font-size="18" fill="{C_SOL}" font-weight="700" letter-spacing="2">☀ CALCULADORA SOLAR</text>
+    <text x="20" y="38" font-family="Barlow,sans-serif" font-size="9" fill="{C_DIM}" letter-spacing="3">SISTEMA FOTOVOLTAICO HÍBRIDO — ON-GRID + RESPALDO EN BATERÍAS</text>
+    <text x="20" y="52" font-family="Share Tech Mono,monospace" font-size="8" fill="#2A3A55">DIAGRAMA UNIFILAR  ·  PLANO ELÉCTRICO  ·  NTC 2050 / RETIE</text>
+    '''
+
+    # Title block
+    tb_y = H - 65
+    title = f'''
+    <rect x="0" y="{tb_y}" width="{W}" height="65" fill="#0F1525" stroke="#2A3A55" stroke-width="0.8"/>
+    <line x1="0" y1="{tb_y}" x2="{W}" y2="{tb_y}" stroke="{C_HIB}" stroke-width="1.5"/>
+    <text x="12" y="{tb_y+16}" font-family="Rajdhani,sans-serif" font-size="12" fill="{C_HIB}" font-weight="700">
+        ☀ DIAGRAMA UNIFILAR — SISTEMA FOTOVOLTAICO HÍBRIDO (ON-GRID + BATERÍAS)</text>
+    <text x="12" y="{tb_y+30}" font-family="Rajdhani,sans-serif" font-size="9" fill="{C_TEXT}">
+        Proyecto: {proy}  |  Municipio: {mun}  |  Config: {pan_serie}S×{n_strings}P  |  Baterías: {n_baterias} ud. @ {v_bat}V {cap_bat_ah}Ah  |  Inversor: {pot_inv_kw:.1f}kW</text>
+    <text x="12" y="{tb_y+44}" font-family="Share Tech Mono,monospace" font-size="8" fill="{C_DIM}">
+        Array: {n_paneles}×{pot_panel}Wp={pot_inst/1000:.2f}kWp  Vmpp={v_str_mpp:.0f}V  I={i_array:.1f}A  |  Calculadora Solar HÍBRIDO  |  {datetime.now().strftime("%d/%m/%Y")}  |  Plano N°02</text>
+    <text x="{W-12}" y="{tb_y+16}" text-anchor="end" font-family="Share Tech Mono,monospace" font-size="9" fill="{C_DIM}">N°02  Rev.A</text>
+    '''
+
+    return f'''<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"
+         style="background:{C_BG};border-radius:12px;width:100%;max-height:720px;">
+      <defs>
+        <pattern id="grid_h2" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#12192B" stroke-width="0.3"/>
+        </pattern>
+      </defs>
+      <rect width="{W}" height="{H-65}" fill="url(#grid_h2)"/>
+      {header}{wires}{arr}{cb}{inv}{bat}{med}{red}{tac}{cargas_detalle}{modos}{gnd}{leg2}{title}
+    </svg>'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GENERACIÓN DE PDF — DIMENSIONAMIENTO HÍBRIDO COMPLETO
+# ═══════════════════════════════════════════════════════════════════════════════
+def generar_pdf_hibrido(proyecto_id: int, proyecto_info: tuple, datos: dict) -> bytes:
+    """Genera un PDF con toda la información del dimensionamiento HÍBRIDO
+    generada hasta el momento: consumo, banco de baterías, array FV,
+    inversor híbrido, verificaciones MPPT, balance solar/red y análisis
+    económico (si ya se visitó ese tab). `datos` trae los valores ya
+    calculados en el Tab 5 (Dimensionamiento), sin recalcular nada aquí."""
+    conn = get_conn()
+    cargas_df = pd.read_sql("SELECT * FROM cargas WHERE proyecto_id=?", conn, params=(proyecto_id,))
+    conn.close()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.6*cm, rightMargin=1.6*cm,
+                            topMargin=1.6*cm, bottomMargin=1.6*cm)
+
+    SOL    = colors.HexColor("#F59E0B")
+    DARK   = colors.HexColor("#0A0E1A")
+    CARD   = colors.HexColor("#1A2235")
+    CARD2  = colors.HexColor("#1E2A3F")
+    TEXT   = colors.HexColor("#E8EDF5")
+    TEXT2  = colors.HexColor("#8A9BBD")
+    GREEN  = colors.HexColor("#00E676")
+    PUR    = colors.HexColor("#A78BFA")
+    BORDER = colors.HexColor("#2A3A55")
+
+    styles = getSampleStyleSheet()
+    titulo_st = ParagraphStyle("titulo_hib", fontName="Helvetica-Bold", fontSize=16,
+                                textColor=SOL, alignment=TA_CENTER, spaceAfter=4)
+    sub_st    = ParagraphStyle("sub_hib", fontName="Helvetica", fontSize=9,
+                                textColor=TEXT2, alignment=TA_CENTER, spaceAfter=8)
+    sec_st    = ParagraphStyle("sec_hib", fontName="Helvetica-Bold", fontSize=11,
+                                textColor=SOL, spaceBefore=10, spaceAfter=4)
+    foot_st   = ParagraphStyle("foot_hib", fontName="Helvetica-Oblique", fontSize=7.5,
+                                textColor=TEXT2, alignment=TA_CENTER, spaceBefore=6)
+
+    def _tabla(filas, col_widths, color_valor=TEXT, bold_valor=False):
+        t = Table(filas, colWidths=col_widths)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,0), SOL),
+            ("TEXTCOLOR",    (0,0), (-1,0), DARK),
+            ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
+            *[("BACKGROUND", (0,i), (-1,i), CARD if i % 2 else CARD2) for i in range(1, len(filas))],
+            ("TEXTCOLOR",    (0,1), (-1,-1), color_valor),
+            ("FONTNAME",     (0,1), (-1,-1), "Helvetica-Bold" if bold_valor else "Helvetica"),
+            ("FONTSIZE",     (0,0), (-1,-1), 9),
+            ("ALIGN",        (1,0), (1,-1), "RIGHT"),
+            ("GRID",         (0,0), (-1,-1), 0.4, BORDER),
+            ("TOPPADDING",   (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 5),
+        ]))
+        return t
+
+    story = []
+    story.append(Paragraph("☀  CALCULADORA SOLAR — DIMENSIONAMIENTO HÍBRIDO", titulo_st))
+    story.append(Paragraph(
+        f"Proyecto: <b>{proyecto_info[1]}</b>  |  Municipio: {proyecto_info[2] or '—'}  |  "
+        f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", sub_st))
+    story.append(HRFlowable(width="100%", thickness=1, color=SOL, spaceAfter=8))
+
+    # ── Consumo (inventario de cargas) ──────────────────────────────────────
+    if not cargas_df.empty:
+        story.append(Paragraph("⚡  INVENTARIO DE CARGAS", sec_st))
+        cargas_df["pot_total_w"] = cargas_df["cantidad"] * cargas_df["potencia_w"]
+        cargas_df["consumo_wh"]  = cargas_df["pot_total_w"] * cargas_df["horas_dia"]
+        filas_c = [["Electrodoméstico", "Cant.", "Pot. (W)", "Horas/día", "Consumo (Wh/día)"]]
+        for _, r in cargas_df.iterrows():
+            filas_c.append([r["electrodomestico"], str(int(r["cantidad"])),
+                            f"{r['potencia_w']:,.0f}", f"{r['horas_dia']:.1f}",
+                            f"{r['consumo_wh']:,.0f}"])
+        filas_c.append(["TOTAL", "", "", "", f"{cargas_df['consumo_wh'].sum():,.0f}"])
+        story.append(_tabla(filas_c, [6.5*cm, 2*cm, 2.5*cm, 2.5*cm, 3.5*cm]))
+        story.append(Spacer(1, 0.4*cm))
+
+    # ── Banco de baterías ─────────────────────────────────────────────────
+    story.append(Paragraph("🔋  BANCO DE BATERÍAS", sec_st))
+    story.append(_tabla([
+        ["Indicador", "Valor"],
+        ["N° de unidades", f"{datos['n_baterias']}"],
+        ["Tensión del banco", f"{datos['v_bat']} V DC"],
+        ["Capacidad por batería", f"{datos['cap_bat_ah']:.0f} Ah"],
+        ["Capacidad real del banco", f"{datos['cap_real_kwh']:.2f} kWh"],
+        ["DoD / Eficiencia (η)", f"{datos['dod_pct']}% / {datos['eff_pct']}%"],
+        ["Energía útil", f"{datos['energia_util_kwh']:.2f} kWh"],
+        ["Autonomía real", f"{datos['autonomia_h']:.1f} h ({datos['autonomia_h']/24:.2f} días)"],
+    ], [8*cm, 9*cm], color_valor=PUR, bold_valor=True))
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Array fotovoltaico e inversor híbrido ────────────────────────────────
+    story.append(Paragraph("🔆  PANEL Y PARÁMETROS DE ENTRADA", sec_st))
+    story.append(_tabla([
+        ["Parámetro", "Valor"],
+        ["Consumo diario (con FS)", f"{datos['consumo_fs']:,.0f} Wh/día"],
+        ["HSP", f"{datos['hsp']:.2f} h/día"],
+        ["% del consumo a respaldar con solar", f"{datos['pct_respaldo']}%"],
+        ["Factor de pérdidas (FP)", f"{datos['fp_pct']}%"],
+        ["Sobredimensionamiento", f"{datos['sobredim_pct']}%"],
+        ["Panel", f"{datos['wp']:.0f} Wp · Voc {datos['voc']}V · "
+                   f"Vmpp {datos['vmpp']}V · Impp {datos['impp']}A"],
+    ], [8*cm, 9*cm]))
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("📐  DIMENSIONAMIENTO DEL ARRAY E INVERSOR HÍBRIDO", sec_st))
+    story.append(_tabla([
+        ["Indicador", "Valor"],
+        ["Paneles totales", f"{datos['n_paneles']} unidades"],
+        ["Configuración de strings", f"{datos['pan_serie']}S × {datos['n_strings']}P"],
+        ["Potencia instalada del array", f"{datos['pot_inst_kwp']:.2f} kWp"],
+        ["Vmpp string", f"{datos['v_str_mpp']:.1f} V"],
+        ["Voc string", f"{datos['v_str_oc']:.1f} V"],
+        ["Corriente del array", f"{datos['i_array']:.1f} A"],
+        ["Dentro del rango MPPT", "✓ Sí" if datos["mppt_ok"] else "✗ Revisar"],
+        ["Inversor híbrido recomendado", f"{datos['pot_inv_kw']} kW"],
+    ], [8*cm, 9*cm], color_valor=GREEN, bold_valor=True))
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Balance energético solar / red ───────────────────────────────────────
+    story.append(Paragraph("⚖  BALANCE ENERGÉTICO SOLAR / RED", sec_st))
+    story.append(_tabla([
+        ["Indicador", "Valor"],
+        ["Generación diaria estimada", f"{datos['gen_dia_kwh']:.2f} kWh/día"],
+        ["Generación anual estimada", f"{datos['gen_dia_kwh']*365:,.0f} kWh/año"],
+        ["Autoconsumo solar", f"{datos['autocon_pct']:.0f}%"],
+        ["Cobertura de la red (resto)", f"{100 - datos['pct_respaldo']:.0f}%"],
+    ], [8*cm, 9*cm]))
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Análisis económico (si está disponible) ──────────────────────────────
+    if datos.get("economico"):
+        eco = datos["economico"]
+        story.append(Paragraph("💹  ANÁLISIS ECONÓMICO", sec_st))
+        story.append(_tabla([
+            ["Indicador", "Valor"],
+            ["Inversión total estimada", f"${eco.get('inversion_total', 0):,.0f}"],
+            ["Beneficio anual estimado", f"${eco.get('beneficio_anio', 0):,.0f}"],
+            ["Retorno de inversión (payback)", f"{eco.get('payback_anios', 0):.1f} años"],
+            ["Generación anual", f"{eco.get('gen_anio', 0):,.0f} kWh/año"],
+            ["CO₂ evitado al año", f"{eco.get('co2_anio', 0):,.0f} kg/año"],
+        ], [8*cm, 9*cm], color_valor=GREEN, bold_valor=True))
+        story.append(Spacer(1, 0.4*cm))
+
+    story.append(Spacer(1, 0.4*cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    story.append(Paragraph(
+        "Generado con Calculadora Solar · Memoria de cálculo técnica del dimensionamiento "
+        "híbrido; no reemplaza el diseño detallado ni la verificación en obra.", foot_st))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+def generar_pdf_economico_hibrido(proyecto_id: int, proyecto_info: tuple, datos: dict) -> bytes:
+    """Genera un PDF con toda la información mostrada en el Tab 6 ·
+    Económico del sistema HÍBRIDO: parámetros usados, indicadores
+    financieros, desglose de inversión + ambiental y el flujo de caja
+    proyectado año a año (ahorro por autoconsumo + ingreso por inyección)."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.6*cm, rightMargin=1.6*cm,
+                            topMargin=1.6*cm, bottomMargin=1.6*cm)
+
+    SOL    = colors.HexColor("#F59E0B")
+    DARK   = colors.HexColor("#0A0E1A")
+    CARD   = colors.HexColor("#1A2235")
+    CARD2  = colors.HexColor("#1E2A3F")
+    TEXT   = colors.HexColor("#E8EDF5")
+    TEXT2  = colors.HexColor("#8A9BBD")
+    GREEN  = colors.HexColor("#00E676")
+    BORDER = colors.HexColor("#2A3A55")
+
+    styles = getSampleStyleSheet()
+    titulo_st = ParagraphStyle("titulo_eco_h", fontName="Helvetica-Bold", fontSize=16,
+                                textColor=SOL, alignment=TA_CENTER, spaceAfter=4)
+    sub_st    = ParagraphStyle("sub_eco_h", fontName="Helvetica", fontSize=9,
+                                textColor=TEXT2, alignment=TA_CENTER, spaceAfter=8)
+    sec_st    = ParagraphStyle("sec_eco_h", fontName="Helvetica-Bold", fontSize=11,
+                                textColor=SOL, spaceBefore=10, spaceAfter=4)
+    foot_st   = ParagraphStyle("foot_eco_h", fontName="Helvetica-Oblique", fontSize=7.5,
+                                textColor=TEXT2, alignment=TA_CENTER, spaceBefore=6)
+
+    def _tabla(filas, col_widths, color_valor=TEXT, bold_valor=False, header_rows=1):
+        t = Table(filas, colWidths=col_widths, repeatRows=header_rows)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,header_rows-1), SOL),
+            ("TEXTCOLOR",    (0,0), (-1,header_rows-1), DARK),
+            ("FONTNAME",     (0,0), (-1,header_rows-1), "Helvetica-Bold"),
+            *[("BACKGROUND", (0,i), (-1,i), CARD if i % 2 else CARD2)
+              for i in range(header_rows, len(filas))],
+            ("TEXTCOLOR",    (0,header_rows), (-1,-1), color_valor),
+            ("FONTNAME",     (0,header_rows), (-1,-1), "Helvetica-Bold" if bold_valor else "Helvetica"),
+            ("FONTSIZE",     (0,0), (-1,-1), 8.5),
+            ("ALIGN",        (1,0), (-1,-1), "RIGHT"),
+            ("GRID",         (0,0), (-1,-1), 0.4, BORDER),
+            ("TOPPADDING",   (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+        ]))
+        return t
+
+    story = []
+    story.append(Paragraph("💹  CALCULADORA SOLAR — ANÁLISIS ECONÓMICO Y AMBIENTAL (HÍBRIDO)", titulo_st))
+    story.append(Paragraph(
+        f"Proyecto: <b>{proyecto_info[1]}</b>  |  Municipio: {proyecto_info[2] or '—'}  |  "
+        f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", sub_st))
+    story.append(HRFlowable(width="100%", thickness=1, color=SOL, spaceAfter=8))
+
+    story.append(Paragraph("⚙  SISTEMA DIMENSIONADO", sec_st))
+    story.append(_tabla([
+        ["Parámetro", "Valor"],
+        ["Paneles", f"{datos['n_pan']} × {datos['wp']:.0f} Wp ({datos['pot_inst']/1000:.2f} kWp)"],
+        ["Baterías", f"{datos['n_bat']} × {datos['cap_bat']:.0f} Ah @ {datos['v_bat']}V"],
+        ["Inversor híbrido", f"{datos['pot_inv']:.1f} kW"],
+        ["Generación diaria", f"{datos['gen_dia']:.2f} kWh/día"],
+        ["Autoconsumo", f"{datos['autocon_pct']:.0f}%"],
+        ["Autonomía batería", f"{datos['aut_real_h']:.1f} h ({datos['aut_real_h']/24:.2f} días)"],
+    ], [7*cm, 10*cm]))
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("💰  PARÁMETROS ECONÓMICOS USADOS", sec_st))
+    story.append(_tabla([
+        ["Parámetro", "Valor"],
+        ["Tarifa energía", f"${datos['tarifa']:,.0f}/kWh"],
+        ["TMAR", f"{datos['tmar']}%/año"],
+        ["Vida útil de análisis", f"{datos['vida']} años"],
+        ["Escalación tarifa", f"{datos['escal']}%/año"],
+        ["Mantenimiento anual", f"{datos['mant_pct']}% de la inversión"],
+    ], [7*cm, 10*cm]))
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("📊  INDICADORES FINANCIEROS", sec_st))
+    story.append(_tabla([
+        ["Indicador", "Valor"],
+        ["Inversión total", f"${datos['inv_total']:,.0f}"],
+        ["Beneficio mensual (año 1)", f"${datos['ben_mes']:,.0f}"],
+        ["Beneficio anual (año 1)", f"${datos['ben_anio']:,.0f}"],
+        ["Payback simple", f"{datos['payback']:.1f} años"],
+        ["Payback descontado", f"{datos['pb_desc']} años"],
+        [f"VPN ({datos['vida']} años)", f"${datos['vpn_final']:,.0f}"],
+        ["TIR", f"{datos['tir']:.1f}%  "
+                f"({'> TMAR — viable' if datos['tir'] > datos['tmar'] else '< TMAR — revisar supuestos'})"],
+    ], [7*cm, 10*cm], color_valor=GREEN, bold_valor=True))
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("🧾  DESGLOSE DE INVERSIÓN + AMBIENTAL", sec_st))
+    story.append(_tabla([
+        ["Concepto", "Valor"],
+        [f"{datos['n_pan']} × Panel {datos['wp']:.0f}Wp", f"${datos['inv_pan']:,.0f}"],
+        [f"Inversor híbrido {datos['pot_inv']:.1f}kW", f"${datos['costo_inv']:,.0f}"],
+        [f"{datos['n_bat']} × Batería {datos['cap_bat']:.0f}Ah @ {datos['v_bat']}V",
+         f"${datos['inv_bat']:,.0f}"],
+        ["Cableado + protecciones", f"${datos['pcable']:,.0f}"],
+        ["Estructura + mano de obra", f"${datos['otros']:,.0f}"],
+        ["INVERSIÓN TOTAL", f"${datos['inv_total']:,.0f}"],
+        [f"Ahorro autoconsumo/mes ({datos['autocon_pct']:.0f}%)", f"${datos['ahorro_mes']:,.0f}"],
+        ["Ingreso inyección/mes", f"${datos['inyeccion_mes']:,.0f}"],
+        ["Gen. anual", f"{datos['gen_anio']:,.0f} kWh"],
+        ["CO₂ evitado/año", f"{datos['co2']:,.0f} kg"],
+        ["Árboles equivalentes", f"≈{datos['arboles']:.0f}/año"],
+    ], [7*cm, 10*cm], color_valor=SOL, bold_valor=True))
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("📈  FLUJO DE CAJA PROYECTADO", sec_st))
+    filas_fc = [["Año", "Ahorro ($)", "Inyección ($)", "Flujo neto ($)",
+                 "V. presente ($)", "VPN acum. ($)"]]
+    for f in datos["flujos"]:
+        filas_fc.append([str(f["año"]), f"{f['ahorro']:,.0f}", f"{f['inyeccion']:,.0f}",
+                         f"{f['neto']:,.0f}", f"{f['vp']:,.0f}", f"{f['vpn_acum']:,.0f}"])
+    story.append(_tabla(filas_fc, [1.5*cm, 3*cm, 3*cm, 3*cm, 3*cm, 3.5*cm]))
+
+    story.append(Spacer(1, 0.5*cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    story.append(Paragraph(
+        f"TIR {datos['tir']:.1f}% "
+        f"{'&gt; TMAR → proyecto viable' if datos['tir'] > datos['tmar'] else '&lt; TMAR → revisar supuestos'}. "
+        "Factor CO₂ UPME Colombia: 0.126 kgCO₂/kWh. Degradación de paneles: 0.5%/año. "
+        "Generado con Calculadora Solar; esta es una memoria de cálculo financiera, no "
+        "reemplaza un estudio de factibilidad formal.", foot_st))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUNCIÓN PRINCIPAL — mostrar_hibrido()
+# ═══════════════════════════════════════════════════════════════════════════════
+def mostrar_hibrido(proyecto_id: int, session_state: dict) -> None:
+    """Punto de entrada desde solar_app.py"""
+
+    st.markdown("""
+    <style>
+    .hib-badge {
+        display:inline-block;background:linear-gradient(90deg,#F59E0B,#FF6B35);
+        color:#0A0E1A;font-family:'Rajdhani',sans-serif;font-weight:700;
+        font-size:0.75rem;padding:2px 10px;border-radius:20px;letter-spacing:1px;margin-left:8px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class='hero-header'>
+        <div class='hero-title'>☀ CALCULADORA SOLAR
+            <span class='hib-badge'>HÍBRIDO</span>
+        </div>
+        <div class='hero-sub'>DIMENSIONAMIENTO — SISTEMA FOTOVOLTAICO HÍBRIDO (ON-GRID + BATERÍAS)</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Leer BD (independiente del módulo OFF-GRID) ───────────────────────────
+    conn = get_conn()
+    p_info = conn.execute("SELECT * FROM proyectos WHERE id=?", (proyecto_id,)).fetchone()
+    cargas_df = pd.read_sql(
+        "SELECT cantidad, potencia_w, horas_dia FROM cargas WHERE proyecto_id=?",
+        conn, params=(proyecto_id,))
+    panel_row = conn.execute(
+        "SELECT potencia_wp, voc, isc FROM paneles WHERE proyecto_id=? ORDER BY id DESC LIMIT 1",
+        (proyecto_id,)).fetchone()
+    # Leer último recibo directamente de la BD
+    recibo_row = conn.execute(
+        "SELECT kwh_periodo, dias_periodo, periodo, tarifa_kwh FROM recibos "
+        "WHERE proyecto_id=? ORDER BY id DESC LIMIT 1",
+        (proyecto_id,)).fetchone()
+    conn.close()
+
+    # Consumo desde inventario de cargas
+    consumo_inv  = (cargas_df["cantidad"] * cargas_df["potencia_w"] * cargas_df["horas_dia"]).sum() \
+                    if not cargas_df.empty else 0.0
+
+    # Consumo desde recibo: BD tiene prioridad sobre session_state
+    if recibo_row and recibo_row[0]:
+        dias        = recibo_row[1] if recibo_row[1] else 30
+        consumo_rec = round(float(recibo_row[0]) * 1000 / dias, 1)  # kWh/período → Wh/día
+        periodo_rec = recibo_row[2] or ""
+        tarifa_bd   = float(recibo_row[3]) if recibo_row[3] else 700.0
+    else:
+        consumo_rec = session_state.get("consumo_recibo_wh", 0.0)
+        periodo_rec = session_state.get("recibo_ref_periodo", "")
+        tarifa_bd   = 700.0
+
+    hsp_guardado = p_info[3] if p_info and p_info[3] else None
+    pot_panel_def= int(panel_row[0]) if panel_row else 550
+    voc_def      = float(panel_row[1]) if panel_row else 49.9
+    isc_def      = float(panel_row[2]) if panel_row else 14.0
+
+
+    # ── Banner de datos del proyecto ─────────────────────────────────────────
+    _proy_nombre = p_info[1] if p_info else "—"
+    _proy_mun    = p_info[2] if p_info and p_info[2] else "—"
+    _consumo_max = max(consumo_inv, consumo_rec)
+    _panel_info  = f"{pot_panel_def} Wp · Voc {voc_def}V" if panel_row else "Sin panel guardado"
+    _hsp_txt     = f"{hsp_guardado} h/día" if hsp_guardado else "No guardada"
+    _recibo_txt  = f"{periodo_rec} · {consumo_rec:,.0f} Wh/día" if consumo_rec > 0 else "—"
+    _cargas_txt  = f"{consumo_inv:,.0f} Wh/día ({len(cargas_df)} cargas)" if consumo_inv > 0 else "—"
+
+    st.markdown(f"""
+    <div style='background:#0F1525;border:1px solid #2A3A55;border-radius:10px;
+     padding:0.8rem 1.2rem;margin-bottom:1rem;display:grid;
+     grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0.6rem;'>
+        <div>
+            <div style='font-size:0.65rem;color:#8A9BBD;letter-spacing:1px;text-transform:uppercase;'>Proyecto</div>
+            <div style='font-family:Rajdhani,sans-serif;font-size:1rem;color:#FFB300;font-weight:700;'>{_proy_nombre}</div>
+            <div style='font-size:0.72rem;color:#8A9BBD;'>📍 {_proy_mun}</div>
+        </div>
+        <div>
+            <div style='font-size:0.65rem;color:#8A9BBD;letter-spacing:1px;text-transform:uppercase;'>Consumo disponible</div>
+            <div style='font-family:Share Tech Mono;font-size:0.95rem;color:#00E676;'>{_consumo_max:,.0f} Wh/día</div>
+            <div style='font-size:0.7rem;color:#8A9BBD;'>Cargas: {_cargas_txt[:30]}</div>
+        </div>
+        <div>
+            <div style='font-size:0.65rem;color:#8A9BBD;letter-spacing:1px;text-transform:uppercase;'>Recibo energía</div>
+            <div style='font-family:Share Tech Mono;font-size:0.85rem;color:#00BCD4;'>{_recibo_txt}</div>
+        </div>
+        <div>
+            <div style='font-size:0.65rem;color:#8A9BBD;letter-spacing:1px;text-transform:uppercase;'>Panel solar</div>
+            <div style='font-family:Share Tech Mono;font-size:0.85rem;color:#FFD54F;'>{_panel_info}</div>
+        </div>
+        <div>
+            <div style='font-size:0.65rem;color:#8A9BBD;letter-spacing:1px;text-transform:uppercase;'>HSP guardada</div>
+            <div style='font-family:Share Tech Mono;font-size:0.85rem;color:#FFB300;'>{_hsp_txt}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── TABS HÍBRIDO ──────────────────────────────────────────────────────────
+    tab_h1,tab_h2,tab_h3,tab_h4,tab_h5,tab_h6,tab_h7,tab_h8,tab_h9 = st.tabs([
+        "⚡ 1 · Consumo",
+        "🌞 2 · Irradiación",
+        "🔆 3 · Panel",
+        "🔋 4 · Baterías",
+        "📐 5 · Dimensionamiento",
+        "💹 6 · Económico",
+        "🔲 7 · Plano Paneles",
+        "📋 8 · Diagrama Unifilar",
+        "🔌 9 · Cableado",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H1 — CONSUMO
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h1:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>1</span>
+        CONSUMO ENERGÉTICO DEL PROYECTO</div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='formula-box'>
+            El sistema híbrido cubre el consumo con energía solar, usa baterías de respaldo
+            y puede importar/exportar energía de/a la red.<br>
+            <b>Factor de seguridad: 20%</b> (incluye pérdidas térmicas, cableado y eficiencia del inversor).
+        </div>""", unsafe_allow_html=True)
+
+        opciones = ["⚡ Inventario de cargas (Módulo Cargas)"]
+        if consumo_rec > 0:
+            opciones.append(f"🧾 Recibo de energía ({periodo_rec})")
+            opciones.append("📊 Mayor de los dos (recomendado)")
+
+        if consumo_inv == 0 and consumo_rec == 0:
+            st.markdown("""
+            <div class='warn-box'>
+                ⚠ No hay consumo registrado para este proyecto.<br>
+                Puedes registrar el consumo de dos formas:<br>
+                <b>• Inventario de cargas:</b> ve al módulo <b>Dimensionamiento OFF-GRID → Tab 1 (Cargas)</b><br>
+                <b>• Recibo de energía:</b> ve al módulo <b>Dimensionamiento OFF-GRID → Tab 2 (Recibo Luz)</b><br>
+                Una vez guardadas las cargas o el recibo, vuelve aquí y el consumo se cargará automáticamente.
+            </div>
+            """, unsafe_allow_html=True)
+            st.info("💡 El consumo del proyecto se comparte entre todos los sistemas "
+                    "(OFF-GRID, ON-GRID e HÍBRIDO). Solo necesitas ingresarlo una vez.")
+            return
+
+        fuente_h = st.radio("Base de consumo:", opciones, horizontal=True, key="hib_fuente")
+        if "Recibo" in fuente_h:
+            consumo_base = consumo_rec
+        elif "Mayor" in fuente_h:
+            consumo_base = max(consumo_inv, consumo_rec)
+        else:
+            consumo_base = consumo_inv
+
+        consumo_fs_hib = consumo_base * 1.20
+
+        col1,col2,col3,col4 = st.columns(4)
+        for c_col, val, unit, lbl, col_c in [
+            (col1, consumo_inv,    "Wh/día","Inventario cargas",  "#FFB300"),
+            (col2, consumo_rec,    "Wh/día","Recibo energía",     "#00BCD4"),
+            (col3, consumo_base,   "Wh/día","Consumo base",       "#00E676"),
+            (col4, consumo_fs_hib, "Wh/día","Con 20% FS híbrido", "#F59E0B"),
+        ]:
+            with c_col:
+                st.markdown(f"""
+                <div class='metric-box' style='border-top:2px solid {col_c};'>
+                    <div class='metric-val' style='color:{col_c};'>{val:,.0f}</div>
+                    <div class='metric-unit'>{unit}</div>
+                    <div class='metric-label'>{lbl}</div>
+                </div>""", unsafe_allow_html=True)
+
+        session_state["hib_consumo_fs"] = consumo_fs_hib
+
+        st.markdown("""
+        <div class='info-note' style='margin-top:1rem;'>
+            ℹ El <b>sistema híbrido</b> aplica un 20% de factor de seguridad: mayor que ON-GRID (20%)
+            porque incluye pérdidas adicionales de conversión DC→Batería→AC, y menor que OFF-GRID
+            aislado puro (20%) porque la red eléctrica actúa como respaldo de último recurso.
+        </div>""", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H2 — IRRADIACIÓN / HSP
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h2:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>2</span>
+        HORA SOLAR PICO (HSP) E IRRADIACIÓN</div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='formula-box'>
+            HSP = Irradiación mensual (kWh/m²/mes) ÷ 30 días &nbsp;|&nbsp;
+            Para sistemas híbridos se puede usar el <b>promedio anual</b>
+            (la red y las baterías compensan los meses de menor irradiación).
+        </div>""", unsafe_allow_html=True)
+
+        col_h21, col_h22 = st.columns([1.1, 0.9])
+        with col_h21:
+            st.markdown("""
+            <div class='sol-card' style='border-color:rgba(245,158,11,0.5);'>
+                <div style='color:#F59E0B;font-family:Rajdhani,sans-serif;font-weight:600;
+                            margin-bottom:0.4rem;font-size:1.05rem;'>
+                    🌍 Global Solar Atlas — Banco Mundial (Recomendado)
+                </div>
+                <div style='font-size:0.82rem;color:#8A9BBD;margin-bottom:0.6rem;'>
+                    Herramienta oficial del Banco Mundial. Muestra GHI, DNI y
+                    <b>HSP directamente en el mapa</b> para cualquier coordenada.
+                    Clic en el mapa → panel lateral con datos de irradiación.
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            st.link_button("🔗 Global Solar Atlas en nueva pestaña",
+                           "https://globalsolaratlas.info/map/",
+                           use_container_width=True)
+
+            st.markdown("""
+            
+            <div class='info-note' style='font-size:0.8rem;margin-bottom:0.5rem;'>
+                📌 <b>Cómo usar:</b> Haz clic en la ubicación → Panel lateral →
+                <b>PVOUT</b> (h/día) = HSP directa &nbsp;|&nbsp;
+                <b>GHI</b> (kWh/m²/año) ÷ 365 = HSP diaria
+            </div>""", unsafe_allow_html=True)
+
+            with st.expander("📋 Otras fuentes de irradiación", expanded=False):
+                st.markdown("""
+                <div style='font-size:0.83rem;color:#8A9BBD;line-height:1.9;'>
+                    <b style='color:#E8EDF5;'>PVGIS (JRC Europa)</b><br>
+                    re.jrc.ec.europa.eu/pvg_tools/es/<br><br>
+                    <b style='color:#E8EDF5;'>NASA POWER</b><br>
+                    power.larc.nasa.gov/data-access-viewer/<br><br>
+                    <b style='color:#F59E0B;'>💡 Híbrido:</b>
+                    <span style='color:#8A9BBD;'>Usa el promedio anual.
+                    Las baterías y la red cubren los meses bajos.</span>
+                </div>""", unsafe_allow_html=True)
+                st.link_button("🔗 Abrir PVGIS en nueva pestaña",
+                               "https://re.jrc.ec.europa.eu/pvg_tools/es/",
+                               use_container_width=True)
+
+        with col_h22:
+            _hsp_val_h   = float(hsp_guardado) if hsp_guardado else 0.0
+            _hsp_valid_h = 1.0 <= _hsp_val_h <= 8.0
+            _irr_def_hib = max(50.0, min(round(_hsp_val_h * 30, 1) if _hsp_valid_h else 150.0, 300.0))
+
+            st.markdown("<div class='sol-card'>", unsafe_allow_html=True)
+            st.markdown("**📐 Calcular HSP del proyecto**")
+
+            # Opción A — desde irradiación mensual
+            irr_hib = st.number_input(
+                "Opción A — Irradiación mensual (kWh/m²/mes)",
+                min_value=50.0, max_value=300.0, value=_irr_def_hib, step=0.5,
+                help="Valor desde Global Solar Atlas (GHI/mes) o PVGIS. "
+                     "Para híbrido usar el promedio anual.",
+                key="hib_irr")
+            hsp_hib_a = irr_hib / 30
+
+            # Opción B — PVOUT directo
+            _pvout_def = _hsp_val_h if _hsp_valid_h else hsp_hib_a
+            _pvout_def = max(1.0, min(_pvout_def, 8.0))
+            hsp_hib_b = st.number_input(
+                "Opción B — PVOUT directo (h/día) desde Global Solar Atlas",
+                min_value=1.0, max_value=8.0, value=_pvout_def, step=0.01,
+                help="Valor PVOUT del Global Solar Atlas en h/día = HSP directa",
+                key="hib_pvout")
+
+            fuente_hib = st.radio(
+                "Usar como HSP del proyecto:",
+                [f"Opción A: {hsp_hib_a:.2f} h/día (desde irradiación mensual)",
+                 f"Opción B: {hsp_hib_b:.2f} h/día (desde PVOUT directo)"],
+                key="hib_fuente_hsp", horizontal=False)
+            hsp_hib = hsp_hib_a if "Opción A" in fuente_hib else hsp_hib_b
+
+            pr_hib = st.slider(
+                "Performance Ratio FP (%)", 70, 90, 80,
+                help="FP típico híbrido: 78-85%", key="hib_pr")
+            factor_hib = st.slider(
+                "Factor híbrido (%)", 110, 130, 120,
+                help="110%=solo ahorro · 120%=balance · 130%=máx respaldo",
+                key="hib_factor")
+
+            hsp_ef = hsp_hib * (pr_hib / 100)
+
+            st.markdown(f"""
+            <div class='result-highlight'>
+                <div style='color:#8A9BBD;font-size:0.8rem;'>
+                    {""+str(irr_hib)+" kWh/m²/mes ÷ 30 = " if "Opción A" in fuente_hib
+                     else "PVOUT Global Solar Atlas = "}
+                </div>
+                <div class='val'>{hsp_hib:.2f} h/día (HSP)</div>
+                <div style='color:#F59E0B;font-size:0.82rem;margin-top:0.2rem;'>
+                    HSP efectiva (×FP {pr_hib}%) = <b>{hsp_ef:.2f} h/día</b>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            if st.button("💾 Guardar HSP", use_container_width=True, key="hib_save_hsp"):
+                conn = get_conn()
+                conn.execute("UPDATE proyectos SET hsp=? WHERE id=?",
+                             (round(hsp_hib, 2), proyecto_id))
+                conn.commit(); conn.close()
+                st.success(f"✅ HSP = {hsp_hib:.2f} h/día guardado")
+                st.rerun()
+
+            if hsp_guardado:
+                st.markdown(f"""
+                <div class='info-note' style='margin-top:0.5rem;'>
+                    ✅ HSP del proyecto: <b>{hsp_guardado} h/día</b>
+                </div>""", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        session_state["_hib_hsp"]    = hsp_hib
+        session_state["_hib_hsp_ef"] = hsp_ef
+        session_state["_hib_pr"]     = pr_hib / 100
+        session_state["_hib_factor"] = factor_hib / 100
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H3 — PANEL SOLAR
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h3:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>3</span>
+        PARÁMETROS DEL PANEL SOLAR</div>""", unsafe_allow_html=True)
+
+        # Catalogo de paneles
+        CATALOGO_PANELES_HIB = {
+            "JinkoSolar Tiger Neo 550":  {"wp": 550, "voc": 49.8, "vmpp": 41.8, "isc": 13.96, "impp": 13.16},
+            "Trina Solar Vertex 550":    {"wp": 550, "voc": 49.5, "vmpp": 41.6, "isc": 14.01, "impp": 13.21},
+            "Canadian Solar HiKu6 550":  {"wp": 550, "voc": 49.7, "vmpp": 41.7, "isc": 13.98, "impp": 13.18},
+            "LONGi Hi-MO 6 550":         {"wp": 550, "voc": 50.2, "vmpp": 42.1, "isc": 13.95, "impp": 13.15},
+            "JA Solar JAM72D30 550":     {"wp": 550, "voc": 49.6, "vmpp": 41.5, "isc": 14.02, "impp": 13.22},
+            "Risen RSM132-8-650M":       {"wp": 650, "voc": 56.4, "vmpp": 47.1, "isc": 14.71, "impp": 13.80},
+        }
+        with st.expander("Catalogo de Paneles Solares", expanded=False):
+            _cat_cols_h = st.columns(3)
+            for _hi, (_hpnom, _hpp) in enumerate(CATALOGO_PANELES_HIB.items()):
+                with _cat_cols_h[_hi % 3]:
+                    st.markdown(f"""
+                    <div style='background:#1A2235;border:1px solid #2A3A55;border-radius:8px;
+                                padding:0.6rem;text-align:center;margin-bottom:0.4rem;'>
+                        <div style='font-size:0.72rem;color:#F59E0B;font-weight:600;'>{_hpnom}</div>
+                        <div style='font-family:Share Tech Mono;font-size:0.85rem;color:#FFD54F;'>{_hpp['wp']}Wp</div>
+                        <div style='font-size:0.7rem;color:#8A9BBD;'>Voc={_hpp['voc']}V Isc={_hpp['isc']}A</div>
+                    </div>""", unsafe_allow_html=True)
+                    if st.button("Usar", key=f"hib_cat_{_hi}", use_container_width=True):
+                        session_state["_hib_panel_cat"] = _hpnom
+                        session_state["_hib_panel_params"] = _hpp
+                        st.rerun()
+
+        _hib_cat_params = session_state.get("_hib_panel_params", {})
+
+        col_h31, col_h32 = st.columns(2)
+        with col_h31:
+            st.markdown("<div class='sol-card'>", unsafe_allow_html=True)
+            if _hib_cat_params:
+                st.markdown(f"<div class='info-note' style='margin-bottom:0.5rem;'>Catalogo: <b>{session_state.get('_hib_panel_cat','')}</b></div>", unsafe_allow_html=True)
+            hib_modelo = st.text_input("Modelo del panel",
+                placeholder="Ej: Canadian Solar CS6W-550T",
+                value=session_state.get("_hib_panel_cat", _sv(panel_row[0] if panel_row else "")), key="hib_modelo")
+            hib_wp   = st.number_input("Potencia pico (Wp)", 50, 1000, int(_hib_cat_params.get("wp", pot_panel_def)), key="hib_wp")
+            hib_voc  = st.number_input("Tension Voc (V)", 5.0, 100.0, max(5.0, min(float(_hib_cat_params.get("voc", voc_def)), 100.0)), step=0.1, key="hib_voc")
+            hib_vmpp = st.number_input("Tension Vmpp (V)", 5.0, 80.0,
+                                        float(_hib_cat_params.get("vmpp", round(voc_def*0.82,1))), step=0.1, key="hib_vmpp")
+            hib_isc  = st.number_input("Corriente Isc (A)", 0.1, 30.0, max(0.1, min(float(_hib_cat_params.get("isc", isc_def)), 30.0)), step=0.1, key="hib_isc")
+            hib_impp = st.number_input("Corriente Impp (A)", 0.1, 25.0,
+                                        float(_hib_cat_params.get("impp", round(isc_def*0.95,1))), step=0.1, key="hib_impp")
+
+            # Strings MPPT hibrido
+            st.markdown("<hr class='sep' style='margin:0.8rem 0;'>", unsafe_allow_html=True)
+            st.markdown("**Calculo Strings MPPT (HIBRIDO)**")
+            hib_mppt_max = st.number_input("Tension maxima MPPT inversor hibrido (V)",
+                                            100.0, 1000.0, 600.0, 10.0, key="hib_mppt_max")
+            if hib_voc > 0 and hib_mppt_max > 0:
+                _hib_pps = int(hib_mppt_max / hib_voc)
+                _hib_fus = hib_isc * 1.25
+                _hib_fus_std = next((f for f in [10,15,20,25,30,40] if f >= _hib_fus), 40)
+                st.markdown(f"""
+                <div class='formula-box'>
+                    {hib_mppt_max:.0f}V / {hib_voc}V = <b style='color:#F59E0B;'>{_hib_pps} paneles/string</b>
+                    | Fusible string: <b style='color:#FFB300;'>{_hib_fus_std}A DC</b>
+                </div>""", unsafe_allow_html=True)
+                session_state["_hib_paneles_por_string"] = _hib_pps
+
+            if st.button("Guardar Panel", use_container_width=True, key="hib_save_panel"):
+                conn = get_conn()
+                conn.execute("DELETE FROM paneles WHERE proyecto_id=?", (proyecto_id,))
+                conn.execute("INSERT INTO paneles(proyecto_id,modelo,potencia_wp,voc,isc) VALUES(?,?,?,?,?)",
+                             (proyecto_id, hib_modelo, hib_wp, hib_voc, hib_isc))
+                conn.commit(); conn.close()
+                session_state.pop("_hib_panel_cat", None)
+                session_state.pop("_hib_panel_params", None)
+                st.success("Panel guardado"); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col_h32:
+            _hib_fus2 = hib_isc * 1.25
+            _hib_fus_std2 = next((f for f in [10,15,20,25,30,40] if f >= _hib_fus2), 40)
+            _hib_corr_ac = hib_wp / 220 if hib_wp > 0 else 20
+            _hib_brk_ac = _hib_corr_ac * 1.25
+            _hib_brk_std = next((f for f in [16,20,25,32,40,50,63] if f >= _hib_brk_ac), 63)
+            st.markdown(f"""
+            <div class='sol-card'>
+                <div style='color:#F59E0B;font-family:Rajdhani,sans-serif;font-weight:600;
+                            margin-bottom:1rem;font-size:1.1rem;'>FICHA TECNICA</div>
+                <div style='display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;'>
+                    <div style='background:#161D30;border-radius:8px;padding:1rem;text-align:center;'>
+                        <div style='font-family:Share Tech Mono;font-size:1.8rem;color:#FFB300;'>{hib_wp}</div>
+                        <div style='font-size:0.75rem;color:#8A9BBD;margin-top:0.3rem;'>Wp - POT. PICO</div>
+                    </div>
+                    <div style='background:#161D30;border-radius:8px;padding:1rem;text-align:center;'>
+                        <div style='font-family:Share Tech Mono;font-size:1.8rem;color:#00BCD4;'>{hib_voc}</div>
+                        <div style='font-size:0.75rem;color:#8A9BBD;margin-top:0.3rem;'>V - Voc</div>
+                    </div>
+                    <div style='background:#161D30;border-radius:8px;padding:1rem;text-align:center;'>
+                        <div style='font-family:Share Tech Mono;font-size:1.8rem;color:#FFD54F;'>{hib_vmpp}</div>
+                        <div style='font-size:0.75rem;color:#8A9BBD;margin-top:0.3rem;'>V - Vmpp</div>
+                    </div>
+                    <div style='background:#161D30;border-radius:8px;padding:1rem;text-align:center;'>
+                        <div style='font-family:Share Tech Mono;font-size:1.8rem;color:#A78BFA;'>{hib_impp:.1f}</div>
+                        <div style='font-size:0.75rem;color:#8A9BBD;margin-top:0.3rem;'>A - Impp</div>
+                    </div>
+                </div>
+                <div style='margin-top:0.8rem;background:#161D30;border-radius:8px;padding:0.8rem;text-align:center;'>
+                    <div style='font-family:Share Tech Mono;font-size:0.85rem;color:#F59E0B;'>
+                        FF = {(hib_vmpp*hib_impp/(hib_voc*hib_isc)*100) if hib_voc*hib_isc>0 else 0:.1f}%
+                    </div>
+                    <div style='font-size:0.72rem;color:#8A9BBD;margin-top:0.3rem;'>Factor de Forma (mayor o igual 72% ideal)</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Catalogos inversores hibridos y baterias
+            st.markdown("""
+            <div style='color:#F59E0B;font-family:Rajdhani,sans-serif;font-weight:600;
+                        font-size:0.9rem;margin:0.8rem 0 0.4rem;'>CATALOGOS DE REFERENCIA</div>""",
+                unsafe_allow_html=True)
+            _inv_hib_cat = [
+                {"Marca":"Deye",   "Modelo":"SUN-5K-SG04LP1","Tipo":"HIBRIDO","kW":5},
+                {"Marca":"Growatt","Modelo":"SPF 5000ES",     "Tipo":"HIBRIDO","kW":5},
+                {"Marca":"Solis",  "Modelo":"RHI-5K-48ES",   "Tipo":"HIBRIDO","kW":5},
+                {"Marca":"Victron","Modelo":"MultiPlus-II 5k","Tipo":"HIBRIDO","kW":5},
+            ]
+            st.dataframe(pd.DataFrame(_inv_hib_cat).set_index("Marca"), use_container_width=True, hide_index=False)
+            st.markdown(f"""
+            <div class='sol-card' style='margin-top:0.6rem;'>
+                <div style='color:#00E676;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.5rem;'>PROTECCIONES AC</div>
+                <div style='font-size:0.8rem;color:#8A9BBD;'>Breaker 2P <b style='color:#00E676;'>{_hib_brk_std}A</b>
+                | DPS Tipo II 275V 40kA | Tierra TT</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H4 — BATERÍAS
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h4:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>4</span>
+        BANCO DE BATERÍAS (RESPALDO)</div>""", unsafe_allow_html=True)
+
+        # Catalogo baterias LiFePO4
+        with st.expander("Catalogo de Baterias LiFePO4", expanded=False):
+            _hib_bats_cat = [
+                {"Marca": "Pylontech", "Modelo": "US5000",       "kWh": 4.8,  "V": 48,   "Ah": 100, "Ciclos": "6000"},
+                {"Marca": "Dyness",    "Modelo": "BX51100",      "kWh": 5.12, "V": 51.2, "Ah": 100, "Ciclos": "4000"},
+                {"Marca": "BYD",       "Modelo": "Battery Box",  "kWh": 5.1,  "V": 51.2, "Ah": 100, "Ciclos": "4000"},
+                {"Marca": "CATL",      "Modelo": "EnerOne Plus", "kWh": 5.0,  "V": 48,   "Ah": 104, "Ciclos": "6000"},
+                {"Marca": "Sunsynk",   "Modelo": "LBSA016",      "kWh": 5.12, "V": 51.2, "Ah": 100, "Ciclos": "4000"},
+                {"Marca": "Hubble",    "Modelo": "AM-5",         "kWh": 5.5,  "V": 51.2, "Ah": 107, "Ciclos": "4000"},
+            ]
+            st.dataframe(pd.DataFrame(_hib_bats_cat).set_index("Marca"), use_container_width=True, hide_index=False)
+            st.markdown("<div class='info-note'>LiFePO4 - DoD 80-90% - BMS integrado - Compatible con inversores hibridos.</div>", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='formula-box'>
+            Cap. banco (Wh) = Consumo/dia x Dias autonomia / DoD<br>
+            N baterias = Cap. banco (Ah) / Cap. bateria (Ah)<br>
+            En sistemas hibridos el banco actua como <b>respaldo nocturno y ante cortes de red</b>.
+        </div>""", unsafe_allow_html=True)
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            st.markdown("<div class='sol-card'>", unsafe_allow_html=True)
+            st.markdown("<div style='color:#A78BFA;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.8rem;'>PARAMETROS BANCO</div>", unsafe_allow_html=True)
+
+            # Leer horas guardadas desde Tab 3 (recibo) si existen
+            _horas_default_hib = session_state.get("_hib_horas_aut_val",
+                                  session_state.get("horas_autonomia_deseada", 24.0))
+            hib_horas_aut = st.number_input(
+                "Horas de autonomía deseada (h)",
+                min_value=1.0, max_value=168.0,
+                value=float(_horas_default_hib),
+                step=1.0,
+                help="8h = nocturno | 24h = 1 día | 48h = 2 días. "
+                     "La red cubre el resto. Se toma del Módulo 2 si está configurado.",
+                key="hib_horas_aut")
+            hib_dias_aut = hib_horas_aut / 24.0
+
+            # Mostrar equivalencia
+            st.markdown(f"""
+            <div style='font-family:Share Tech Mono;color:#00BCD4;font-size:0.8rem;
+                        margin:-0.3rem 0 0.6rem 0;'>
+                {hib_horas_aut:.0f} h = {hib_dias_aut:.3f} días de autonomía
+            </div>
+            """, unsafe_allow_html=True)
+
+            hib_dod = st.slider(
+                "Profundidad de descarga DoD (%)", 50, 90, 80,
+                help="AGM/GEL: 50%. LiFePO4: 80-90%", key="hib_dod")
+            hib_eff = st.slider(
+                "Eficiencia sistema η (%)", 70, 98, 90,
+                help="Pérdidas inversor (~5%), cableado (~2%), autodescarga (~3%). Típico: 85-92%",
+                key="hib_eff")
+            hib_v_bat = st.selectbox(
+                "Tensión nominal batería (V)", [12, 24, 48], index=2, key="hib_v_bat")
+            hib_cap_bat = st.number_input(
+                "Capacidad batería (Ah)", min_value=50, max_value=500, value=100, step=10,
+                key="hib_cap_bat")
+            hib_tipo_bat = st.selectbox(
+                "Tecnología", ["LiFePO4 (recomendado)", "AGM", "GEL", "Litio NMC"],
+                key="hib_tipo_bat")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col_b2:
+            consumo_base_h4 = session_state.get("hib_consumo_fs", consumo_inv * 1.20)
+            if consumo_base_h4 > 0:
+                consumo_h_h4    = (consumo_base_h4 / 1.20) / 24.0
+                e_auto_wh_h4    = consumo_h_h4 * hib_horas_aut
+                # Cap banco: E_auto / (DoD × η) — 5 parámetros
+                hib_eff_dec      = hib_eff / 100
+                hib_dod_dec      = hib_dod / 100
+                cap_banco_kwh_h4 = e_auto_wh_h4 / 1000 / (hib_dod_dec * hib_eff_dec)
+                cap_banco_ah    = cap_banco_kwh_h4 * 1000 / hib_v_bat
+                n_bats          = math.ceil(cap_banco_ah / hib_cap_bat)
+                if n_bats % 2 != 0 and n_bats > 1: n_bats += 1
+                cap_real_wh     = n_bats * hib_cap_bat * hib_v_bat
+                cap_real_kwh_h4 = cap_real_wh / 1000
+                energia_util_h4 = cap_real_kwh_h4 * hib_dod_dec * hib_eff_dec
+                aut_real_h      = energia_util_h4 * 1000 / max(consumo_h_h4, 0.001)
+                session_state["_hib_horas_aut_val"] = hib_horas_aut
+                session_state["_hib_aut_horas"]     = aut_real_h
+                session_state["_hib_eff"]           = hib_eff
+
+                st.markdown(f"""
+                <div class='result-highlight' style='border-color:rgba(167,139,250,0.5);
+                     background:linear-gradient(135deg,rgba(167,139,250,0.08),rgba(167,139,250,0.02));'>
+                    <div style='color:#8A9BBD;font-size:0.8rem;'>
+                        Consumo horario: {consumo_h_h4:.3f} Wh/h × {hib_horas_aut:.0f}h
+                        ÷ (DoD {hib_dod}% × η {hib_eff}%) = <b>{cap_banco_kwh_h4:.2f} kWh banco</b></div>
+                    <div class='val' style='color:#A78BFA;'>{cap_banco_ah:.1f} Ah requeridos</div>
+                </div>
+                <div class='metric-grid' style='margin-top:0.8rem;'>
+                    <div class='metric-box' style='border-color:rgba(167,139,250,0.5);'>
+                        <div class='metric-val' style='color:#A78BFA;'>{n_bats}</div>
+                        <div class='metric-unit'>unidades</div>
+                        <div class='metric-label'>BATERÍAS</div>
+                    </div>
+                    <div class='metric-box'>
+                        <div class='metric-val'>{cap_real_kwh_h4:.1f}</div>
+                        <div class='metric-unit'>kWh</div>
+                        <div class='metric-label'>CAP. REAL</div>
+                    </div>
+                    <div class='metric-box' style='border-color:rgba(0,230,118,0.5);'>
+                        <div class='metric-val'>{aut_real_h:.1f}</div>
+                        <div class='metric-unit'>h reales</div>
+                        <div class='metric-label'>AUTONOMÍA</div>
+                    </div>
+                    <div class='metric-box' style='border-color:rgba(0,188,212,0.5);'>
+                        <div class='metric-val'>{n_bats * hib_cap_bat}</div>
+                        <div class='metric-unit'>Ah</div>
+                        <div class='metric-label'>CAPACIDAD Ah</div>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+                _delta_h = aut_real_h - hib_horas_aut
+                _delta_color = "#00E676" if _delta_h >= 0 else "#FF5252"
+                st.markdown(f"""
+                <div style='background:rgba(167,139,250,0.06);border:1px solid rgba(167,139,250,0.25);
+                            border-radius:8px;padding:0.6rem 1rem;margin-top:0.6rem;font-size:0.82rem;'>
+                    <span style='color:#8A9BBD;'>Autonomía deseada:</span>
+                    <b style='color:#00BCD4;font-family:Share Tech Mono;'>{hib_horas_aut:.0f} h</b>
+                    &nbsp;|&nbsp;
+                    <span style='color:#8A9BBD;'>Autonomía real:</span>
+                    <b style='color:{_delta_color};font-family:Share Tech Mono;'>{aut_real_h:.1f} h</b>
+                    &nbsp;
+                    <span style='color:{_delta_color};'>({_delta_h:+.1f} h)</span>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class='sol-card' style='margin-top:0.8rem;'>
+                    <div style='color:#A78BFA;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.6rem;'>
+                    CONFIGURACIÓN DEL BANCO — 5 PARÁMETROS</div>
+                    <table style='width:100%;font-size:0.82rem;border-collapse:collapse;'>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>① Consumo diario (Wh/día)</td>
+                            <td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>{consumo_h_h4*24:,.0f} Wh</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>② Autonomía deseada</td>
+                            <td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>{hib_horas_aut:.0f} h = {hib_horas_aut/24:.3f} días</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>③ Voltaje banco</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{hib_v_bat} V DC</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>④ DoD</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{hib_dod}%</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>⑤ Eficiencia sistema η</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{hib_eff}%</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>Tecnología</td>
+                            <td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{hib_tipo_bat}</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>Cap. por batería</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{hib_cap_bat} Ah</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>Capacidad banco real</td>
+                            <td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{cap_real_kwh_h4:.2f} kWh</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>✅ Energía utilizable</td>
+                            <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{energia_util_h4:.2f} kWh</td>
+                        </tr>
+                        <tr>
+                            <td style='color:#8A9BBD;padding:0.35rem 0;'>Autonomía real</td>
+                            <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{aut_real_h:.1f} h / {aut_real_h/24:.2f} días</td>
+                        </tr>
+                    </table>
+                </div>""", unsafe_allow_html=True)
+
+                session_state["_hib_n_baterias"]  = n_bats
+                session_state["_hib_v_bat"]        = hib_v_bat
+                session_state["_hib_cap_bat_ah"]   = hib_cap_bat
+                session_state["_hib_cap_real_wh"]  = cap_real_wh
+                session_state["_hib_aut_real_h"]   = aut_real_h
+            else:
+                st.markdown("<div class='warn-box'>⚠ Completa el Tab 1 (Consumo) primero.</div>",
+                            unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H5 — DIMENSIONAMIENTO HÍBRIDO
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h5:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>5</span>
+        DIMENSIONAMIENTO COMPLETO DEL SISTEMA HÍBRIDO</div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='formula-box'>
+            Pot. array = Consumo×1.15 ÷ (HSP × PR)  |  Strings: Vmpp×n dentro del rango MPPT<br>
+            🔋 Banco bat.: E_total = Consumo × Días ÷ η  →  Ah = E_total ÷ (V × DoD)  |  Inversor híbrido ≈ 90% pot. array
+        </div>""", unsafe_allow_html=True)
+
+        consumo_d5  = session_state.get("hib_consumo_fs", consumo_inv * 1.20)
+        hsp_d5      = session_state.get("_hib_hsp",    hsp_guardado or 4.2)
+        pr_d5_raw   = session_state.get("hib_pr",      80)
+        wp_d5       = session_state.get("hib_wp",      pot_panel_def)
+        voc_d5      = session_state.get("hib_voc",     voc_def)
+        vmpp_d5     = session_state.get("hib_vmpp",    round(voc_def*0.82,1))
+        impp_d5     = session_state.get("hib_impp",    round(isc_def*0.95,1))
+        dias_aut_d5 = session_state.get("hib_dias_aut", 1.0)
+        dod_d5      = session_state.get("hib_dod", 80)
+        eff_d5      = session_state.get("_hib_eff", 90)
+
+        # ── Baterías: priorizar resultados reales de Tab H4 ──────────────────
+        _bat_h4_ok   = "_hib_n_baterias" in session_state and "_hib_v_bat" in session_state
+        n_bat_d5     = int(session_state.get("_hib_n_baterias",  4))
+        v_bat_d5     = int(session_state.get("_hib_v_bat",       48))
+        cap_bat_d5   = float(session_state.get("_hib_cap_bat_ah", 100))
+        cap_real_h4  = float(session_state.get("_hib_cap_real_wh", n_bat_d5 * cap_bat_d5 * v_bat_d5))
+        aut_real_h4  = float(session_state.get("_hib_aut_real_h",  0))
+        dod_h4       = float(session_state.get("hib_dod", 80)) / 100
+        eff_h4       = float(session_state.get("_hib_eff", 90)) / 100
+        energia_util_h4 = (cap_real_h4 / 1000) * dod_h4 * eff_h4
+
+        if consumo_d5 == 0:
+            st.markdown("<div class='warn-box'>⚠ Completa los tabs 1 y 4 primero.</div>",
+                        unsafe_allow_html=True)
+            return
+
+        pr_d5 = (pr_d5_raw / 100) if isinstance(pr_d5_raw, (int,float)) else 0.80
+
+        col_d1, col_d2 = st.columns([1, 1.2])
+        with col_d1:
+            st.markdown("<div class='sol-card'>", unsafe_allow_html=True)
+            st.markdown("**Parámetros de cálculo**")
+            consumo_inp = st.number_input("Consumo diario con FS (Wh/día)",
+                min_value=100.0, value=float(consumo_d5), step=100.0, key="hib_consumo_inp")
+            hsp_inp = st.number_input("HSP (h/día)", min_value=0.5, max_value=12.0,
+                value=float(hsp_d5), step=0.01, key="hib_hsp_inp")
+            pr_inp  = st.slider("Factor pérdidas FP (%)", 70, 90,
+                int(pr_d5*100) if isinstance(pr_d5*100,(int,float)) else 80,
+                help="FP típico híbrido: 78–85%. PDF: E_real = Ed÷FP",
+                key="hib_pr_d5")
+            pct_respaldo_h5 = st.slider(
+                "% del consumo a respaldar con solar (%)", 50, 100, 70,
+                help="PDF ejemplo: 70% → los paneles cubren el 70% del consumo.\n"
+                     "100% = cobertura total | 70% = ahorro parcial con red como respaldo",
+                key="hib_pct_respaldo_d5")
+            sobredim_h5 = st.slider("Sobredim. híbrido (%)", 0, 25, 10,
+                                     help="PDF recomienda 10–20% para híbrido.",
+                                     key="hib_sobredim_d5")
+            wp_inp  = st.number_input("Potencia panel (Wp)", 50, 1000,
+                max(50, min(int(wp_d5), 1000)), key="hib_wp_inp")
+            vmpp_inp= st.number_input("Vmpp (V)", 5.0, 80.0, max(5.0, min(float(vmpp_d5), 80.0)), step=0.1, key="hib_vmpp_inp")
+            voc_inp = st.number_input("Voc (V)", 5.0, 100.0, max(5.0, min(float(voc_d5), 100.0)), step=0.1, key="hib_voc_inp")
+            impp_inp= st.number_input("Impp (A)", 0.1, 25.0, max(0.1, min(float(impp_d5), 25.0)), step=0.1, key="hib_impp_inp")
+
+            st.markdown("<hr style='border-color:#2A3A55;margin:0.5rem 0;'>", unsafe_allow_html=True)
+            st.markdown("<small style='color:#A78BFA;'>Rango MPPT del inversor híbrido:</small>",
+                        unsafe_allow_html=True)
+            v_mppt_min_h = st.number_input("V MPPT mín.", 50, 400, 120, key="hib_vmppt_min")
+            v_mppt_max_h = st.number_input("V MPPT máx.", 200, 1500, 600, key="hib_vmppt_max")
+            st.markdown("</div>", unsafe_allow_html=True)
+            pr_dec       = pr_inp / 100.0
+
+            # consumo base real (sin FS) para el cálculo horario
+            consumo_base_h5 = consumo_inp / 1.20 if consumo_inp > 0 else consumo_inp
+
+            if consumo_base_h5 <= 0:
+                st.markdown("<div class='warn-box'>⚠ Ingresa el consumo en el Tab 1 (Consumo) primero.</div>",
+                            unsafe_allow_html=True)
+            else:
+
+                # ── 1. Banco de baterías — usar resultados de Tab H4 directamente
+                if _bat_h4_ok:
+                    # Valores reales calculados en Tab H4 (Baterías)
+                    n_bats_calc     = n_bat_d5
+                    cap_real        = cap_real_h4
+                    cap_real_kwh_h5 = cap_real_h4 / 1000.0
+                    energia_util_h5 = energia_util_h4
+                    aut_real_hh     = aut_real_h4
+                    horas_aut_h5    = aut_real_h4
+                    e_auto_wh_h5    = energia_util_h4 * 1000.0  # energía útil para referencia
+                    consumo_h_h5    = consumo_base_h5 / 24.0
+
+                    st.markdown(f"""
+                    <div class='info-note' style='border-color:rgba(167,139,250,0.5);
+                                margin-bottom:0.6rem;'>
+                        🔋 <b>Banco de baterías — datos actualizados desde Tab 4:</b>
+                        &nbsp; {n_bats_calc} baterías {cap_bat_d5:.0f}Ah @ {v_bat_d5}V
+                        &nbsp;|&nbsp; Cap. banco: <b style='color:#A78BFA;'>{cap_real_kwh_h5:.2f} kWh</b>
+                        &nbsp;|&nbsp; E. útil: <b style='color:#00E676;'>{energia_util_h5:.2f} kWh</b>
+                        &nbsp;|&nbsp; Autonomía: <b style='color:#00BCD4;'>{aut_real_h4:.1f} h ({aut_real_h4/24:.2f} días)</b>
+                        &nbsp;|&nbsp; DoD: {int(dod_h4*100)}% | η: {int(eff_h4*100)}%
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    # Fallback: recalcular si Tab H4 no ha sido visitado
+                    consumo_h_h5    = consumo_base_h5 / 24.0
+                    horas_aut_h5    = dias_aut_d5 * 24.0
+                    e_auto_wh_h5    = consumo_h_h5 * horas_aut_h5
+                    eff_d5_dec      = eff_d5 / 100.0
+                    dod_d5_dec      = dod_d5 / 100.0
+                    cap_banco_kwh_h5 = e_auto_wh_h5 / 1000.0 / (dod_d5_dec * max(eff_d5_dec, 0.01))
+                    cap_bat_ah_t    = cap_banco_kwh_h5 * 1000.0 / v_bat_d5
+                    n_bats_calc     = math.ceil(cap_bat_ah_t / cap_bat_d5)
+                    if n_bats_calc % 2 != 0 and n_bats_calc > 1: n_bats_calc += 1
+                    cap_real        = n_bats_calc * cap_bat_d5 * v_bat_d5
+                    cap_real_kwh_h5 = cap_real / 1000.0
+                    energia_util_h5 = cap_real_kwh_h5 * dod_d5_dec * eff_d5_dec
+                    aut_real_hh     = energia_util_h5 * 1000.0 / max(consumo_h_h5, 0.001)
+
+                    st.markdown("""
+                    <div class='warn-box' style='margin-bottom:0.6rem;'>
+                        ⚠ No se encontraron datos del <b>Tab 4 · Baterías</b>.
+                        Visita ese tab y configura el banco para sincronizar los datos aquí.
+                    </div>""", unsafe_allow_html=True)
+
+                # ── 2. Paneles — Metodología PDF Híbrido (5 pasos)
+                # PDF: Ed = consumo × porcentaje_respaldo
+                # NO se suma recarga del banco — la red cubre lo que los paneles no cubran
+                consumo_kwh_h5  = consumo_base_h5 / 1000.0
+                pct_resp_dec    = pct_respaldo_h5 / 100.0
+                # ① Ed = consumo × %_respaldo
+                e_parcial_h5    = consumo_kwh_h5 * pct_resp_dec          # kWh a cubrir con solar
+                # ② E_real = Ed / FP  (pérdidas temperatura, inversor, cableado, suciedad)
+                e_real_h5       = e_parcial_h5 / max(pr_dec, 0.01)
+                # ③ P_FV = E_real / HSP
+                pot_pfv_h5      = e_real_h5 / max(hsp_inp, 0.01) * 1000.0   # en W
+                # ④ N = ceil(P_FV / Ppanel) + sobredim
+                n_pan_min_h5    = math.ceil(pot_pfv_h5 / wp_inp)
+                n_pan           = math.ceil(n_pan_min_h5 * (1 + sobredim_h5 / 100))
+                # ⑤ Producción por panel
+                e_panel_h5_wh   = wp_inp * hsp_inp * pr_dec
+                # Energía total que el campo FV genera (referencia para tabla de desglose)
+                e_recarga_h5    = e_auto_wh_h5 / 1000.0  # solo para mostrar en tabla
+
+                # Strings — ajustados para no inflar n_pan
+                pan_s_min    = max(1, math.ceil(v_mppt_min_h / vmpp_inp)) if vmpp_inp > 0 else 1
+                pan_s_max_m  = math.floor(v_mppt_max_h / vmpp_inp)        if vmpp_inp > 0 else 20
+                pan_s_max_v  = math.floor((v_mppt_max_h*1.15) / voc_inp)  if voc_inp  > 0 else 20
+                pan_s_max    = max(min(pan_s_max_m, pan_s_max_v), pan_s_min)
+                pan_serie_h  = 1; n_str_h = n_pan; _bx = 10_000
+                for _s in range(pan_s_min, pan_s_max + 1):
+                    _p = math.ceil(n_pan / _s); _t = _s * _p; _ex = _t - n_pan
+                    if _ex < _bx or (_ex == _bx and abs(_s-_p) < abs(pan_serie_h-n_str_h)):
+                        _bx = _ex; pan_serie_h = _s; n_str_h = _p
+                if pan_s_min > n_pan: pan_serie_h = n_pan; n_str_h = 1
+                n_pan_real   = pan_serie_h * n_str_h
+                pot_inst_h   = n_pan_real * wp_inp
+                v_str_mpp_h  = pan_serie_h * vmpp_inp
+                v_str_oc_h   = pan_serie_h * voc_inp
+                i_arr_h      = impp_inp * n_str_h
+                # 5. Inversor híbrido: potencia del array × FM 25% → tamaño comercial
+                _KW_COM_H5 = [0.5, 1, 1.5, 2, 3, 3.5, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50]
+                _inv_w_h5 = pot_inst_h * 1.25
+                pot_inv_h = float(next((k for k in _KW_COM_H5 if k*1000 >= _inv_w_h5),
+                                        math.ceil(_inv_w_h5/1000)))
+
+                # ── Display fórmula paso a paso (PDF metodología Híbrido) ─────
+                _gen_dia_h5 = (pot_inst_h/1000)*hsp_inp*pr_dec
+                _exc_h5 = (_gen_dia_h5 / e_parcial_h5 - 1) * 100 if e_parcial_h5 > 0 else 0
+                st.markdown(f"""
+                <div class='sol-card' style='border-color:rgba(255,107,53,0.4);margin-top:0.6rem;'>
+                    <div style='color:#FFB300;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.6rem;'>PASO A PASO - PDF - SISTEMA HIBRIDO</div>
+                    <table style='width:100%;font-size:0.82rem;border-collapse:collapse;'>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>Consumo base diario</td>
+                            <td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>{consumo_base_h5:,.0f} Wh/dia</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>% a respaldar con solar</td>
+                            <td style='font-family:Share Tech Mono;color:#FF6B35;text-align:right;'>x {pct_respaldo_h5}% = {e_parcial_h5*1000:,.0f} Wh</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;background:#1A2235;'>
+                            <td style='color:#FFB300;padding:0.3rem 0;font-weight:600;'>1. Ed = consumo x {pct_respaldo_h5}%</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;font-weight:700;'>{e_parcial_h5*1000:,.0f} Wh</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;background:#1A2235;'>
+                            <td style='color:#FFB300;padding:0.3rem 0;font-weight:600;'>2. E_real = Ed / FP ({pr_inp}%)</td>
+                            <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;font-weight:700;'>{e_real_h5*1000:,.0f} Wh</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>3. P_FV = E_real / HSP ({hsp_inp}h)</td>
+                            <td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>{pot_pfv_h5:,.0f} W = {pot_pfv_h5/1000:.2f} kWp</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>4. N = ceil({pot_pfv_h5:.0f}/{wp_inp}) + {sobredim_h5}% sobredim</td>
+                            <td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>{n_pan_min_h5}->{n_pan} paneles</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>5. Prod. panel ({wp_inp}x{hsp_inp}xFP)</td>
+                            <td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>{e_panel_h5_wh:,.0f} Wh/dia</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>Config. strings ({pan_serie_h}S x {n_str_h}P)</td>
+                            <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;font-weight:700;'>{n_pan_real} paneles {wp_inp}Wp</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>Potencia instalada</td>
+                            <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;font-weight:700;'>{pot_inst_h/1000:.2f} kWp</td>
+                        </tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>Exceso vs. consumo respaldado</td>
+                            <td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{_exc_h5:+.1f}%</td>
+                        </tr>
+                        <tr>
+                            <td style='color:#8A9BBD;padding:0.3rem 0;'>Red cubre el restante</td>
+                            <td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>{(1-pct_resp_dec)*100:.0f}% del consumo</td>
+                        </tr>
+                    </table>
+                </div>
+                """, unsafe_allow_html=True)
+                gen_dia_h     = (pot_inst_h / 1000) * hsp_inp * pr_dec
+                consumo_kwh   = consumo_inp / 1000
+                autocon_h     = min(gen_dia_h, consumo_kwh)
+                inj_h         = max(0, gen_dia_h - consumo_kwh)
+                def_h         = max(0, consumo_kwh - gen_dia_h)
+                ac_pct        = autocon_h / consumo_kwh * 100 if consumo_kwh > 0 else 0
+
+                mppt_ok = v_mppt_min_h <= v_str_mpp_h <= v_mppt_max_h
+
+                # Guardar
+                session_state["_hib_n_pan"]       = n_pan_real
+                session_state["_hib_pan_serie"]   = pan_serie_h
+                session_state["_hib_n_strings"]   = n_str_h
+                session_state["_hib_pot_inst"]    = pot_inst_h
+                session_state["_hib_v_str_mpp"]   = v_str_mpp_h
+                session_state["_hib_v_str_oc"]    = v_str_oc_h
+                session_state["_hib_i_array"]     = i_arr_h
+                session_state["_hib_pot_inv"]     = pot_inv_h
+                session_state["_hib_n_baterias"]  = n_bats_calc
+                session_state["_hib_cap_real_wh"] = cap_real
+                session_state["_hib_aut_horas"]   = aut_real_hh if not _bat_h4_ok else aut_real_h4
+                session_state["_hib_gen_dia"]     = gen_dia_h
+                session_state["_hib_autocon_pct"] = ac_pct
+
+                st.markdown(f"""
+                <div class='result-highlight' style='border-color:rgba(245,158,11,0.5);
+                     background:linear-gradient(135deg,rgba(245,158,11,0.1),rgba(245,158,11,0.02));'>
+                    <div style='color:#8A9BBD;font-size:0.8rem;text-transform:uppercase;'>
+                        Potencia mínima del array</div>
+                    <div class='val' style='color:#F59E0B;'>{pot_pfv_h5/1000:.2f} kWp</div>
+                </div>
+                <div class='metric-grid'>
+                    <div class='metric-box' style='border-color:rgba(255,179,0,0.5);'>
+                        <div class='metric-val'>{n_pan_real}</div>
+                        <div class='metric-unit'>paneles</div><div class='metric-label'>TOTAL</div>
+                    </div>
+                    <div class='metric-box'>
+                        <div class='metric-val'>{pot_inst_h/1000:.2f}</div>
+                        <div class='metric-unit'>kWp</div><div class='metric-label'>POT. INST.</div>
+                    </div>
+                    <div class='metric-box' style='border-color:rgba(0,188,212,0.5);'>
+                        <div class='metric-val'>{pan_serie_h}S×{n_str_h}P</div>
+                        <div class='metric-unit'>config</div><div class='metric-label'>STRINGS</div>
+                    </div>
+                    <div class='metric-box' style='border-color:rgba(0,230,118,0.5);'>
+                        <div class='metric-val'>{pot_inv_h}</div>
+                        <div class='metric-unit'>kW</div><div class='metric-label'>INVERSOR HIB.</div>
+                    </div>
+                </div>
+                <div class='formula-box' style='font-size:0.78rem;margin-top:0.4rem;'>
+                    🔌 Inversor: {pot_inst_h/1000:.2f} kWp × 1.25 = {_inv_w_h5/1000:.2f} kW
+                    → <b>Comercial: {pot_inv_h} kW</b>
+                </div>""", unsafe_allow_html=True)
+
+                # ── Resumen de baterías (desde Tab H4) ───────────────────────
+                st.markdown(f"""
+                <div style='display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-top:0.8rem;'>
+                  <div class='sol-card'>
+                    <div style='color:#A78BFA;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.5rem;'>
+                    BANCO BATERIAS {"(Tab 4)" if _bat_h4_ok else "(estimado)"}</div>
+                    <table style='width:100%;font-size:0.8rem;border-collapse:collapse;'>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>N° unidades</td>
+                        <td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{n_bats_calc}</td>
+                      </tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Tensión banco</td>
+                        <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{v_bat_d5} V DC</td>
+                      </tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Cap. real banco</td>
+                        <td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{cap_real_kwh_h5:.2f} kWh</td>
+                      </tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Energia utilizable</td>
+                        <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{energia_util_h5:.2f} kWh</td>
+                      </tr>
+                      <tr>
+                        <td style='color:#8A9BBD;'>Autonomia real</td>
+                        <td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>{aut_real_h4 if _bat_h4_ok else aut_real_hh:.1f} h ({(aut_real_h4 if _bat_h4_ok else aut_real_hh)/24:.2f} dias)</td>
+                      </tr>
+                    </table>
+                  </div>
+                  <div class='sol-card'>
+                    <div style='color:#00BCD4;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.5rem;'>GENERACION FV</div>
+                    <table style='width:100%;font-size:0.8rem;border-collapse:collapse;'>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Gen. diaria</td>
+                        <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{gen_dia_h:.2f} kWh/dia</td>
+                      </tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Autoconsumo</td>
+                        <td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{ac_pct:.1f}%</td>
+                      </tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;'>Inyeccion red</td>
+                        <td style='font-family:Share Tech Mono;color:#FF6B35;text-align:right;'>{inj_h:.2f} kWh/dia</td>
+                      </tr>
+                      <tr>
+                        <td style='color:#8A9BBD;'>Gen. anual est.</td>
+                        <td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{gen_dia_h*365:,.0f} kWh/ano</td>
+                      </tr>
+                    </table>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                # ── CONTROLADOR — 7 verificaciones (híbrido: MPPT integrado en inversor) ─
+                _i_ctrl_h  = pot_inst_h / max(v_bat_d5, 1)       # P/V_bat
+                _i_ctrl_dis= _i_ctrl_h * 1.25
+                _CTRL_H    = [10,20,30,40,60,80,100,120,150,200,250,300]
+                _ctrl_h_com= next((a for a in _CTRL_H if a >= _i_ctrl_dis), _CTRL_H[-1])
+                _voc_str_h = voc_inp * pan_serie_h                 # Voc string a 25°C
+                _temp_min_h= session_state.get("_hib_temp_min", 10)
+                _factor_t_h= 1 + 0.003 * max(0, 25 - _temp_min_h)
+                _voc_str_cor_h = _voc_str_h * _factor_t_h
+                _i_arr_verif_h = impp_inp * n_str_h                # Imp × N_strings
+                _n_ctrl_h  = math.ceil(pot_inst_h / max(mppt_max_h5 := session_state.get("_hib_pot_inst", pot_inst_h), 1))
+
+                def _okh(ok): return "#00E676" if ok else "#FF5252"
+                _v_voc_ok = _voc_str_cor_h <= v_mppt_max_h
+                _v_i_ok   = _i_arr_verif_h <= (session_state.get("hib_mppt_max", v_mppt_max_h))
+
+                st.markdown(f"""
+                <div style='margin-top:0.8rem;'>
+                <div style='color:#FFB300;font-family:Rajdhani,sans-serif;font-weight:600;
+                            margin-bottom:0.5rem;font-size:0.95rem;'>
+                    🎛 INVERSOR HÍBRIDO — MPPT INTEGRADO (7 VERIFICACIONES)</div>
+                <div class='info-note' style='margin-bottom:0.6rem;'>
+                    En sistemas híbridos el MPPT está <b>integrado en el inversor</b>.
+                    Se verifica que el diseño del array cumpla con los límites del equipo.
+                </div>
+                <table style='width:100%;font-size:0.8rem;border-collapse:collapse;
+                              background:#0F1525;border-radius:8px;'>
+                    <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;padding:0.35rem 0.5rem;'>① I_ctrl = P_FV / V_bat × 1.25</td>
+                        <td style='font-family:Share Tech Mono;color:#FFD54F;padding:0.35rem;'>
+                            {pot_inst_h:,.0f}Wp ÷ {v_bat_d5}V = {_i_ctrl_h:.1f}A × 1.25 = {_i_ctrl_dis:.1f}A</td>
+                        <td style='font-family:Share Tech Mono;color:#00E676;padding:0.35rem;font-weight:700;'>
+                            Seleccionar: {_ctrl_h_com}A MPPT</td>
+                    </tr>
+                    <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;padding:0.35rem 0.5rem;'>② Voc string corregida</td>
+                        <td style='font-family:Share Tech Mono;color:#FFD54F;padding:0.35rem;'>
+                            {voc_inp}V × {pan_serie_h} series × {_factor_t_h:.3f} = {_voc_str_cor_h:.1f}V</td>
+                        <td style='font-family:Share Tech Mono;color:{_okh(_v_voc_ok)};padding:0.35rem;font-weight:700;'>
+                            {"✅ ≤ "+str(v_mppt_max_h)+"V" if _v_voc_ok else "❌ Excede Vmáx"}</td>
+                    </tr>
+                    <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;padding:0.35rem 0.5rem;'>③ Corriente array (Imp × N_str)</td>
+                        <td style='font-family:Share Tech Mono;color:#FFD54F;padding:0.35rem;'>
+                            {impp_inp}A × {n_str_h} strings = {_i_arr_verif_h:.1f}A</td>
+                        <td style='font-family:Share Tech Mono;color:#00BCD4;padding:0.35rem;'>
+                            Verificar vs. máx. MPPT inversor</td>
+                    </tr>
+                    <tr style='border-bottom:1px solid #2A3A55;'>
+                        <td style='color:#8A9BBD;padding:0.35rem 0.5rem;'>④ Rango Vmpp string</td>
+                        <td style='font-family:Share Tech Mono;color:#FFD54F;padding:0.35rem;'>
+                            {v_str_mpp_h:.1f}V (rango: {v_mppt_min_h}–{v_mppt_max_h}V)</td>
+                        <td style='font-family:Share Tech Mono;color:{"#00E676" if mppt_ok else "#FF5252"};
+                                   padding:0.35rem;font-weight:700;'>
+                            {"✅ Dentro del rango MPPT" if mppt_ok else "❌ Fuera de rango"}</td>
+                    </tr>
+                    <tr>
+                        <td style='color:#8A9BBD;padding:0.35rem 0.5rem;'>⑤ Tipo</td>
+                        <td style='font-family:Share Tech Mono;color:#A78BFA;padding:0.35rem;' colspan='2'>
+                            MPPT integrado en inversor híbrido — no se requiere controlador externo</td>
+                    </tr>
+                </table>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div style='display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-top:0.8rem;'>
+                  <div class='sol-card'>
+                    <div style='color:#00BCD4;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.5rem;'>ARRAY DC</div>
+                    <table style='width:100%;font-size:0.8rem;border-collapse:collapse;'>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Vmpp string</td><td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{v_str_mpp_h:.0f} V</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Voc string</td><td style='font-family:Share Tech Mono;color:#FF5252;text-align:right;'>{v_str_oc_h:.0f} V</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>I array</td><td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{i_arr_h:.1f} A</td></tr>
+                      <tr><td style='color:#8A9BBD;'>MPPT</td><td style='text-align:right;font-family:Share Tech Mono;color:{"#00E676" if mppt_ok else "#FF5252"};'>{"✓ OK" if mppt_ok else "✗ REVISAR"}</td></tr>
+                    </table>
+                  </div>
+                  <div class='sol-card'>
+                    <div style='color:#A78BFA;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.5rem;'>BATERÍAS — 5 PARÁMETROS</div>
+                    <table style='width:100%;font-size:0.8rem;border-collapse:collapse;'>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>N° unidades</td><td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{n_bats_calc}</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Cap. banco real</td><td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{cap_real_kwh_h5:.2f} kWh</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>DoD / η</td><td style='font-family:Share Tech Mono;color:#FFB300;text-align:right;'>{dod_d5}% / {eff_d5}%</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>✅ Energía utilizable</td><td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{energia_util_h5:.2f} kWh</td></tr>
+                      <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Autonomía real</td><td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{aut_real_hh:.1f} h ({aut_real_hh/24:.2f} días)</td></tr>
+                      <tr><td style='color:#8A9BBD;'>Autoconsumo</td><td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>{ac_pct:.0f}%</td></tr>
+                    </table>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                if not mppt_ok:
+                    st.markdown(f"""
+                    <div class='warn-box'>⚠ Vmpp del string ({v_str_mpp_h:.0f}V) fuera del rango MPPT
+                    ({v_mppt_min_h}–{v_mppt_max_h}V). Ajusta el N° de paneles en serie o cambia el inversor.</div>
+                    """, unsafe_allow_html=True)
+
+                # ── Generar PDF con toda la información del dimensionamiento ─
+                st.markdown("<hr class='sep' style='margin:1rem 0;'>", unsafe_allow_html=True)
+                _eco_hib = None
+                if "_hib_inv_tot" in session_state:
+                    _eco_hib = dict(
+                        inversion_total=session_state.get("_hib_inv_tot", 0),
+                        beneficio_anio=session_state.get("_hib_ben_anio", 0),
+                        payback_anios=session_state.get("_hib_payback", 0),
+                        gen_anio=session_state.get("_hib_gen_anio", gen_dia_h * 365),
+                        co2_anio=session_state.get("_hib_co2_anio", 0),
+                    )
+                _datos_pdf_hib = dict(
+                    n_baterias=n_bats_calc, v_bat=v_bat_d5, cap_bat_ah=cap_bat_d5,
+                    cap_real_kwh=cap_real_kwh_h5, dod_pct=dod_d5, eff_pct=eff_d5,
+                    energia_util_kwh=energia_util_h5, autonomia_h=aut_real_hh,
+                    consumo_fs=consumo_base_h5 * 1.20, hsp=hsp_inp,
+                    pct_respaldo=pct_respaldo_h5, fp_pct=pr_inp, sobredim_pct=sobredim_h5,
+                    wp=wp_inp, voc=voc_inp, vmpp=vmpp_inp, impp=impp_inp,
+                    n_paneles=n_pan_real, pan_serie=pan_serie_h, n_strings=n_str_h,
+                    pot_inst_kwp=pot_inst_h / 1000, v_str_mpp=v_str_mpp_h,
+                    v_str_oc=v_str_oc_h, i_array=i_arr_h, mppt_ok=mppt_ok,
+                    pot_inv_kw=pot_inv_h, gen_dia_kwh=gen_dia_h, autocon_pct=ac_pct,
+                    economico=_eco_hib,
+                )
+                try:
+                    pdf_hib5 = generar_pdf_hibrido(proyecto_id, p_info, _datos_pdf_hib)
+                    st.download_button(
+                        "⬇ Descargar PDF del Dimensionamiento Híbrido", data=pdf_hib5,
+                        file_name=f"SolarCalc_HIBRIDO_{_proy_nombre.replace(' ','_')}_"
+                                  f"{datetime.now().strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf", use_container_width=True, key="dl_pdf_hib5")
+                    if not _eco_hib:
+                        st.caption("💡 Visita el Tab 6 · Económico para incluir también el "
+                                   "análisis financiero en el PDF.")
+                except Exception as ex:
+                    st.error(f"Error generando PDF: {ex}")
+
+        # ══════════════════════════════════════════════════════════════════════════
+        # TAB H6 — ANÁLISIS ECONÓMICO
+        # ══════════════════════════════════════════════════════════════════════════
+    with tab_h6:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>6</span>
+        ANÁLISIS ECONÓMICO Y AMBIENTAL — SISTEMA HÍBRIDO</div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='formula-box'>
+            Basado en dimensionamiento real de Tabs 1-5 ·
+            Ahorro = Autoconsumo×30×Tarifa | Ingreso inyección = Excedente×Precio_red (≈50% tarifa)<br>
+            VPN = Σ FlujoNeto_t/(1+TMAR)^t − Inversión | CO₂ factor Colombia: 0.126 kgCO₂/kWh
+        </div>""", unsafe_allow_html=True)
+
+        pot_inst_e  = session_state.get("_hib_pot_inst",  0.0)
+        n_pan_e     = session_state.get("_hib_n_pan",     0)
+        n_bats_e    = session_state.get("_hib_n_baterias", 0)
+        pot_inv_e   = session_state.get("_hib_pot_inv",   3.0)
+        gen_dia_e   = session_state.get("_hib_gen_dia",   0.0)
+        ac_pct_e    = session_state.get("_hib_autocon_pct", 0.0)
+        consumo_fe  = session_state.get("hib_consumo_fs", consumo_inv * 1.20)
+        cap_real_e  = session_state.get("_hib_cap_real_wh", 0.0)
+        aut_h_e     = session_state.get("_hib_aut_horas", 0.0)
+        hsp_e       = session_state.get("_hib_hsp",  hsp_guardado or 4.2)
+        v_bat_e     = session_state.get("_hib_v_bat", 48)
+        cap_bat_e   = session_state.get("_hib_cap_bat_ah", 100)
+        eff_hib_e   = session_state.get("_hib_eff", 90)
+        wp_e        = session_state.get("hib_wp", pot_panel_def)
+        aut_real_h  = session_state.get("_hib_aut_real_h", aut_h_e)
+        gen_anio_e  = gen_dia_e * 365
+        co2_h       = gen_anio_e * 0.126
+        arboles_h   = co2_h / 21
+
+        if pot_inst_e == 0 or consumo_fe == 0:
+            st.markdown("<div class='warn-box'>⚠ Completa el dimensionamiento en los Tabs anteriores primero.</div>",
+                        unsafe_allow_html=True)
+        else:
+            consumo_kwh_h = consumo_fe / 1000
+            autocon_h2    = min(gen_dia_e, consumo_kwh_h)
+            inj_h2        = max(0, gen_dia_e - consumo_kwh_h)
+            autoconsumo_pct_h = autocon_h2 / consumo_kwh_h * 100 if consumo_kwh_h > 0 else 0
+
+            st.markdown(f"""
+            <div class='info-note' style='margin-bottom:0.8rem;'>
+                📊 <b>Sistema:</b> {n_pan_e} paneles {wp_e}Wp ({pot_inst_e/1000:.2f} kWp) |
+                {n_bats_e} baterías {cap_bat_e}Ah @ {v_bat_e}V |
+                Inversor híbrido {pot_inv_e:.1f} kW |
+                Gen.: <b style='color:#00E676;'>{gen_dia_e:.2f} kWh/día</b> |
+                Autoconsumo: <b style='color:#FFB300;'>{autoconsumo_pct_h:.0f}%</b> |
+                Autonomía: <b style='color:#A78BFA;'>{aut_real_h:.1f} h</b>
+            </div>""", unsafe_allow_html=True)
+
+            col_e1, col_e2 = st.columns([1, 1.2])
+            with col_e1:
+                st.markdown("<div class='sol-card'>", unsafe_allow_html=True)
+                st.markdown("""<div style='color:#F59E0B;font-family:Rajdhani,sans-serif;
+                    font-weight:600;margin-bottom:0.8rem;'>💰 PARÁMETROS ECONÓMICOS</div>""",
+                    unsafe_allow_html=True)
+                tarifa_h     = st.number_input("Tarifa energía ($/kWh)", 100.0, 5000.0, tarifa_bd, 50.0, key="hib_tarifa")
+                precio_pan_h = st.number_input(f"Precio panel {wp_e}Wp ($/u)", 50000.0, 2e6, 320000.0, 10000.0, key="hib_ppanel")
+                costo_inv_h  = st.number_input(f"Costo inversor híbrido {pot_inv_e:.1f}kW ($)", 500000.0, 15e6, min(pot_inv_e*3500000.0, 15e6), 100000.0, key="hib_cinv")
+                precio_bat_h = st.number_input(f"Precio batería {cap_bat_e}Ah ($/u)", 50000.0, 5e6, 800000.0, 50000.0, key="hib_pbat")
+                pcable_h     = st.number_input("Cableado + protecciones ($)", 0.0, 10e6, 800000.0, 50000.0, key="hib_pcable")
+                otros_h      = st.number_input("Estructura + mano de obra ($)", 0.0, 50e6, 1500000.0, 100000.0, key="hib_otros")
+                tmar_h       = st.slider("TMAR (%/año)", 5.0, 25.0, 12.0, 0.5, key="hib_tmar")
+                vida_h       = st.slider("Vida útil análisis (años)", 10, 30, 25, 1, key="hib_vida")
+                escal_h      = st.slider("Escalación tarifa (%/año)", 0.0, 15.0, 5.0, 0.5, key="hib_escal")
+                mant_h_pct   = st.slider("Mantenimiento anual (% inversión)", 0.0, 5.0, 1.0, 0.1, key="hib_mant")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with col_e2:
+                inv_pan_h   = n_pan_e  * precio_pan_h
+                inv_bat_h   = n_bats_e * precio_bat_h
+                inv_tot_h   = inv_pan_h + costo_inv_h + inv_bat_h + pcable_h + otros_h
+                mant_anio_h = inv_tot_h * mant_h_pct / 100
+
+                tmar_dh = tmar_h / 100; escal_dh = escal_h / 100
+                flujos_h = []
+                vpn_hib  = -inv_tot_h
+                for yr in range(1, vida_h + 1):
+                    tarifa_yr  = tarifa_h * ((1 + escal_dh) ** yr)
+                    gen_yr     = gen_dia_e * 365 * ((1 - 0.005) ** yr)
+                    ahorro_yr  = autocon_h2 * 365 * tarifa_yr
+                    ing_iny_yr = inj_h2 * 365 * tarifa_yr * 0.5
+                    neto_yr    = ahorro_yr + ing_iny_yr - mant_anio_h
+                    vp_yr      = neto_yr / ((1 + tmar_dh) ** yr)
+                    vpn_hib   += vp_yr
+                    flujos_h.append({"año": yr, "ahorro": ahorro_yr, "inyeccion": ing_iny_yr,
+                                     "neto": neto_yr, "vp": vp_yr, "vpn_acum": vpn_hib})
+
+                ben_mes_h    = (autocon_h2 * tarifa_h + inj_h2 * tarifa_h * 0.5) * 30
+                ben_anio_h   = ben_mes_h * 12
+                payback_h    = inv_tot_h / max(ben_anio_h - mant_anio_h, 0.01)
+                vpn_final_h  = flujos_h[-1]["vpn_acum"]
+                pb_desc_h    = next((f["año"] for f in flujos_h if f["vpn_acum"] >= 0), vida_h + 1)
+
+                def _bvpn(r):
+                    v = -inv_tot_h
+                    for yr in range(1, vida_h+1):
+                        v += (ben_anio_h - mant_anio_h) / ((1+r)**yr)
+                    return v
+                tlo, thi = 0.001, 2.0
+                for _ in range(60):
+                    tm = (tlo+thi)/2
+                    if _bvpn(tm) > 0: tlo = tm
+                    else: thi = tm
+                tir_h_real = tlo * 100
+
+                _pb_ch  = "#00E676" if payback_h<=8 else "#FFB300" if payback_h<=15 else "#FF5252"
+                _vn_ch  = "#00E676" if vpn_final_h>0 else "#FF5252"
+                _ti_ch  = "#00E676" if tir_h_real>tmar_h else "#FF5252"
+
+                st.markdown(f"""
+                <div class='result-highlight' style='border-color:rgba(245,158,11,0.5);'>
+                    <div style='color:#8A9BBD;font-size:0.8rem;text-transform:uppercase;'>Beneficio mensual año 1</div>
+                    <div class='val' style='color:#F59E0B;'>${ben_mes_h:,.0f} / mes</div>
+                </div>
+                <div class='metric-grid' style='margin-top:0.8rem;'>
+                    <div class='metric-box'><div class='metric-val'>${inv_tot_h/1e6:.2f}M</div>
+                        <div class='metric-unit'>COP</div><div class='metric-label'>INVERSIÓN</div></div>
+                    <div class='metric-box' style='border-color:rgba(0,230,118,0.5);'>
+                        <div class='metric-val' style='color:#00E676;'>${ben_anio_h/1e6:.2f}M</div>
+                        <div class='metric-unit'>$/año</div><div class='metric-label'>BENEFICIO AÑO 1</div></div>
+                    <div class='metric-box'>
+                        <div class='metric-val' style='color:{_pb_ch};'>{payback_h:.1f}</div>
+                        <div class='metric-unit'>años</div><div class='metric-label'>PAYBACK</div></div>
+                    <div class='metric-box'>
+                        <div class='metric-val' style='color:#00BCD4;'>{pb_desc_h}</div>
+                        <div class='metric-unit'>años</div><div class='metric-label'>PAYBACK DESC.</div></div>
+                    <div class='metric-box'>
+                        <div class='metric-val' style='color:{_vn_ch};font-size:1.1rem;'>${vpn_final_h/1e6:.2f}M</div>
+                        <div class='metric-unit'>COP</div><div class='metric-label'>VPN {vida_h}a</div></div>
+                    <div class='metric-box'>
+                        <div class='metric-val' style='color:{_ti_ch};'>{tir_h_real:.1f}%</div>
+                        <div class='metric-unit'>/año</div><div class='metric-label'>TIR</div></div>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class='sol-card' style='margin-top:0.8rem;'>
+                    <div style='color:#F59E0B;font-family:Rajdhani,sans-serif;font-weight:600;margin-bottom:0.6rem;'>
+                    DESGLOSE INVERSIÓN + AMBIENTAL</div>
+                    <table style='width:100%;font-size:0.82rem;border-collapse:collapse;'>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>{n_pan_e} × Panel {wp_e}Wp</td><td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>${inv_pan_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Inversor híbrido {pot_inv_e:.1f}kW</td><td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>${costo_inv_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>{n_bats_e} × Batería {cap_bat_e}Ah @ {v_bat_e}V</td><td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>${inv_bat_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Cableado + protecciones</td><td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>${pcable_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Estructura + MO</td><td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>${otros_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;background:#1A2235;'><td style='color:#F59E0B;font-weight:600;'>INVERSIÓN TOTAL</td><td style='font-family:Share Tech Mono;color:#F59E0B;text-align:right;font-weight:700;'>${inv_tot_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Ahorro autoconsumo/mes ({autoconsumo_pct_h:.0f}%)</td><td style='font-family:Share Tech Mono;color:#00E676;text-align:right;'>${autocon_h2*30*tarifa_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Ingreso inyección/mes</td><td style='font-family:Share Tech Mono;color:#FF6B35;text-align:right;'>${inj_h2*30*tarifa_h*0.5:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;background:#1A2235;'><td style='color:#00E676;font-weight:600;'>BENEFICIO MENSUAL</td><td style='font-family:Share Tech Mono;color:#00E676;text-align:right;font-weight:700;'>${ben_mes_h:,.0f}</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Gen. anual</td><td style='font-family:Share Tech Mono;color:#FFD54F;text-align:right;'>{gen_anio_e:,.0f} kWh</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>CO₂ evitado/año</td><td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>{co2_h:,.0f} kg</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>Árboles equiv.</td><td style='font-family:Share Tech Mono;color:#00BCD4;text-align:right;'>≈{arboles_h:.0f}/año</td></tr>
+                        <tr style='border-bottom:1px solid #2A3A55;'><td style='color:#8A9BBD;'>TIR</td><td style='font-family:Share Tech Mono;text-align:right;color:{_ti_ch};font-weight:700;'>{tir_h_real:.1f}% {"✅>TMAR" if tir_h_real>tmar_h else "⚠<TMAR"}</td></tr>
+                        <tr><td style='color:#8A9BBD;'>Autonomía batería</td><td style='font-family:Share Tech Mono;color:#A78BFA;text-align:right;'>{aut_real_h:.1f} h ({aut_real_h/24:.2f} días)</td></tr>
+                    </table>
+                </div>""", unsafe_allow_html=True)
+
+            # Flujo de caja
+            st.markdown("<hr class='sep'>", unsafe_allow_html=True)
+            st.markdown("""<div style='color:#F59E0B;font-family:Rajdhani,sans-serif;
+                font-weight:600;font-size:1rem;margin-bottom:0.5rem;'>
+                📈 FLUJO DE CAJA PROYECTADO</div>""", unsafe_allow_html=True)
+            fc_h = {"Año": [f["año"] for f in flujos_h],
+                    "Ahorro ($)": [f"{f['ahorro']:,.0f}" for f in flujos_h],
+                    "Inyección ($)": [f"{f['inyeccion']:,.0f}" for f in flujos_h],
+                    "Flujo neto ($)": [f"{f['neto']:,.0f}" for f in flujos_h],
+                    "VP ($)": [f"{f['vp']:,.0f}" for f in flujos_h],
+                    "VPN acum. ($)": [f"{f['vpn_acum']:,.0f}" for f in flujos_h]}
+            st.dataframe(fc_h, use_container_width=True, height=300)
+
+            st.markdown(f"""
+            <div class='info-note' style='margin-top:0.8rem;font-size:0.8rem;'>
+                TMAR {tmar_h}% | Escalación tarifa {escal_h}%/año | Mantenimiento {mant_h_pct}%/año |
+                TIR {tir_h_real:.1f}% {'> TMAR → VIABLE ✅' if tir_h_real > tmar_h else '< TMAR → REVISAR ⚠'} |
+                Factor CO₂ UPME: 0.126 kgCO₂/kWh | Degradación paneles: 0.5%/año
+            </div>""", unsafe_allow_html=True)
+
+            session_state["_hib_inv_tot"]   = inv_tot_h
+            session_state["_hib_ben_anio"]  = ben_anio_h
+            session_state["_hib_payback"]   = payback_h
+            session_state["_hib_gen_anio"]  = gen_anio_e
+            session_state["_hib_co2_anio"]  = co2_h
+
+            # ── Descargar toda la información en PDF ────────────────────────
+            st.markdown("<hr class='sep' style='margin:1rem 0;'>", unsafe_allow_html=True)
+            _datos_pdf_eco_h = dict(
+                n_pan=n_pan_e, wp=wp_e, pot_inst=pot_inst_e, n_bat=n_bats_e,
+                cap_bat=cap_bat_e, v_bat=v_bat_e, pot_inv=pot_inv_e, gen_dia=gen_dia_e,
+                autocon_pct=autoconsumo_pct_h, aut_real_h=aut_real_h,
+                tarifa=tarifa_h, tmar=tmar_h, vida=vida_h, escal=escal_h, mant_pct=mant_h_pct,
+                inv_total=inv_tot_h, ben_mes=ben_mes_h, ben_anio=ben_anio_h,
+                payback=payback_h, pb_desc=pb_desc_h, vpn_final=vpn_final_h, tir=tir_h_real,
+                inv_pan=inv_pan_h, costo_inv=costo_inv_h, inv_bat=inv_bat_h,
+                pcable=pcable_h, otros=otros_h,
+                ahorro_mes=autocon_h2 * 30 * tarifa_h, inyeccion_mes=inj_h2 * 30 * tarifa_h * 0.5,
+                gen_anio=gen_anio_e, co2=co2_h, arboles=arboles_h,
+                flujos=flujos_h,
+            )
+            try:
+                pdf_eco_h = generar_pdf_economico_hibrido(proyecto_id, p_info, _datos_pdf_eco_h)
+                st.download_button(
+                    "⬇ Descargar PDF del Análisis Económico", data=pdf_eco_h,
+                    file_name=f"SolarCalc_Economico_HIBRIDO_{_proy_nombre.replace(' ','_')}_"
+                              f"{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf", use_container_width=True, key="dl_pdf_eco_h6")
+            except Exception as ex:
+                st.error(f"Error generando PDF: {ex}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H7 — PLANO DISTRIBUCIÓN PANELES
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h7:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>7</span>
+        PLANO — DISTRIBUCIÓN DE PANELES HÍBRIDO</div>""", unsafe_allow_html=True)
+
+        n_pan_p7  = session_state.get("_hib_n_pan",     0)
+        pan_s_p7  = session_state.get("_hib_pan_serie", 6)
+        n_str_p7  = session_state.get("_hib_n_strings", 1)
+        wp_p7     = session_state.get("hib_wp",         pot_panel_def)
+        n_bats_p7 = session_state.get("_hib_n_baterias",4)
+
+        if n_pan_p7 == 0:
+            st.markdown("<div class='warn-box'>⚠ Completa el dimensionamiento en el Tab 5 primero.</div>",
+                        unsafe_allow_html=True)
+        else:
+            conn = get_conn()
+            p_info7 = conn.execute("SELECT * FROM proyectos WHERE id=?", (proyecto_id,)).fetchone()
+            conn.close()
+
+            svg7 = svg_plano_paneles_hib(n_pan_p7, pan_s_p7, n_str_p7, wp_p7, n_bats_p7, p_info7)
+            render_svg_hib(svg7, height=730)
+
+            st.markdown("<hr class='sep'>", unsafe_allow_html=True)
+            cols7 = st.columns(3)
+            arr_cols7 = min(pan_s_p7, 18)
+            arr_rows7 = math.ceil(n_pan_p7 / arr_cols7)
+            v_str7    = session_state.get("_hib_v_str_mpp", pan_s_p7 * session_state.get("hib_vmpp", 40.0))
+            i_arr7    = session_state.get("_hib_i_array",   n_str_p7 * session_state.get("hib_impp", 13.0))
+            cap_rw7   = session_state.get("_hib_cap_real_wh", 0)
+            aut7      = session_state.get("_hib_aut_horas", 0)
+
+            with cols7[0]:
+                st.markdown(f"""
+                <div class='sol-card'>
+                    <div style='font-family:Rajdhani,sans-serif;color:#F59E0B;font-weight:600;margin-bottom:0.6rem;'>ARRAY HÍBRIDO</div>
+                    <div style='font-size:0.82rem;line-height:1.9;'>
+                        🔆 Paneles: <b style='color:#FFD54F;'>{n_pan_p7} × {wp_p7} Wp</b><br>
+                        📐 Config: <b style='color:#FFD54F;'>{pan_s_p7}S × {n_str_p7}P</b><br>
+                        🏭 Pot. inst.: <b style='color:#FFD54F;'>{n_pan_p7*wp_p7/1000:.2f} kWp</b>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            with cols7[1]:
+                st.markdown(f"""
+                <div class='sol-card'>
+                    <div style='font-family:Rajdhani,sans-serif;color:#F59E0B;font-weight:600;margin-bottom:0.6rem;'>DIMENSIONES</div>
+                    <div style='font-size:0.82rem;line-height:1.9;font-family:Share Tech Mono,monospace;'>
+                        Cols: <b style='color:#00BCD4;'>{arr_cols7}</b>  Filas: <b style='color:#00BCD4;'>{arr_rows7}</b><br>
+                        Ancho: <b style='color:#00BCD4;'>≈{arr_cols7*1.134:.2f} m</b><br>
+                        Alto: <b style='color:#00BCD4;'>≈{arr_rows7*0.686:.2f} m</b><br>
+                        Área: <b style='color:#00E676;'>≈{arr_cols7*1.134*arr_rows7*0.686:.1f} m²</b>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            with cols7[2]:
+                st.markdown(f"""
+                <div class='sol-card'>
+                    <div style='font-family:Rajdhani,sans-serif;color:#A78BFA;font-weight:600;margin-bottom:0.6rem;'>BATERÍAS</div>
+                    <div style='font-size:0.82rem;line-height:1.9;font-family:Share Tech Mono,monospace;'>
+                        N° unidades: <b style='color:#A78BFA;'>{n_bats_p7}</b><br>
+                        Cap. banco: <b style='color:#A78BFA;'>{cap_rw7/1000:.1f} kWh</b><br>
+                        Autonomía: <b style='color:#00E676;'>{aut7:.1f} h</b><br>
+                        Vmpp str.: <b style='color:#00BCD4;'>{v_str7:.0f} V</b>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+            proy7_nom = (p_info7[1] if p_info7 else "Proyecto").replace(" ","_")
+            fname7 = f"Hibrido_Paneles_{proy7_nom}_{datetime.now().strftime('%Y%m%d')}.svg"
+            st.download_button("⬇ Descargar Plano Paneles (SVG)",
+                               data=svg7.encode(), file_name=fname7,
+                               mime="image/svg+xml", use_container_width=True, key="hib_dl_pan")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB H8 — DIAGRAMA UNIFILAR HÍBRIDO
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_h8:
+        st.markdown("""
+        <div class='sol-card-title'><span class='step-badge'>8</span>
+        DIAGRAMA UNIFILAR — SISTEMA HÍBRIDO</div>""", unsafe_allow_html=True)
+
+        n_pan_p8   = session_state.get("_hib_n_pan",      0)
+        pan_s_p8   = session_state.get("_hib_pan_serie",  6)
+        n_str_p8   = session_state.get("_hib_n_strings",  1)
+        wp_p8      = session_state.get("hib_wp",          pot_panel_def)
+        pot_inv_p8 = session_state.get("_hib_pot_inv",    3.0)
+        v_str_p8   = session_state.get("_hib_v_str_mpp",  pan_s_p8 * session_state.get("hib_vmpp",40.0))
+        v_oc_p8    = session_state.get("_hib_v_str_oc",   pan_s_p8 * session_state.get("hib_voc", voc_def))
+        i_arr_p8   = session_state.get("_hib_i_array",    n_str_p8 * session_state.get("hib_impp",13.0))
+        n_bats_p8  = session_state.get("_hib_n_baterias", 4)
+        v_bat_p8   = session_state.get("hib_v_bat",       48)
+        cap_bat_p8 = session_state.get("hib_cap_bat",     100)
+        consumo_p8 = session_state.get("hib_consumo_fs",  consumo_inv * 1.20)
+        hsp_p8     = session_state.get("_hib_hsp",        hsp_guardado or 4.2)
+
+        if n_pan_p8 == 0:
+            st.markdown("<div class='warn-box'>⚠ Completa el dimensionamiento en el Tab 5 primero.</div>",
+                        unsafe_allow_html=True)
+        else:
+            conn = get_conn()
+            p_info8 = conn.execute("SELECT * FROM proyectos WHERE id=?", (proyecto_id,)).fetchone()
+            cargas_p8 = pd.read_sql(
+                "SELECT electrodomestico, cantidad, potencia_w, horas_dia, es_motor "
+                "FROM cargas WHERE proyecto_id=?", conn, params=(proyecto_id,))
+            conn.close()
+
+            svg8 = svg_unifilar_hibrido(
+                n_pan_p8, pan_s_p8, n_str_p8, wp_p8, pot_inv_p8,
+                v_str_p8, v_oc_p8, i_arr_p8,
+                n_bats_p8, v_bat_p8, cap_bat_p8,
+                consumo_p8, hsp_p8, p_info8, cargas_p8)
+            render_svg_hib(svg8, height=740)
+
+            st.markdown("<hr class='sep'>", unsafe_allow_html=True)
+            cols8 = st.columns(4)
+            gen8   = session_state.get("_hib_gen_dia", 0)
+            pay8   = session_state.get("_hib_payback", 0)
+            co2_8  = session_state.get("_hib_co2_anio",0)
+            aut_8  = session_state.get("_hib_aut_horas",0)
+
+            for c8, icon, lbl, val, col8 in [
+                (cols8[0],"☀","Array FV",      f"{n_pan_p8}×{wp_p8}Wp\n{n_pan_p8*wp_p8/1000:.2f}kWp", "#FFB300"),
+                (cols8[1],"🔋","Baterías",      f"{n_bats_p8} ud.\n{session_state.get('_hib_cap_real_wh',0)/1000:.1f}kWh · {aut_8:.0f}h", "#A78BFA"),
+                (cols8[2],"🔄","Inversor Híb.", f"{pot_inv_p8}kW\nMPPT+Charger", "#F59E0B"),
+                (cols8[3],"🌿","CO₂ evitado",  f"{co2_8:,.0f}kg/año\nPayback:{pay8:.1f}a", "#00E676"),
+            ]:
+                with c8:
+                    st.markdown(f"""
+                    <div class='sol-card' style='text-align:center;'>
+                        <div style='font-size:1.5rem;'>{icon}</div>
+                        <div style='font-family:Rajdhani;font-size:0.8rem;color:{col8};font-weight:600;margin:0.3rem 0;'>{lbl}</div>
+                        <div style='font-family:Share Tech Mono;font-size:0.75rem;color:#8A9BBD;white-space:pre;'>{val}</div>
+                    </div>""", unsafe_allow_html=True)
+
+            proy8_nom = (p_info8[1] if p_info8 else "Proyecto").replace(" ","_")
+            fname8 = f"Hibrido_Unifilar_{proy8_nom}_{datetime.now().strftime('%Y%m%d')}.svg"
+            st.download_button("⬇ Descargar Diagrama Unifilar (SVG)",
+                               data=svg8.encode(), file_name=fname8,
+                               mime="image/svg+xml", use_container_width=True, key="hib_dl_uni")
+
+    # ── TAB H9 — CABLEADO ────────────────────────────────────────────────────
+    with tab_h9:
+        if _CABLEADO_DISPONIBLE:
+            # Pasar datos relevantes del sistema híbrido al módulo de cableado
+            # via session_state (ya están guardados desde tabs anteriores)
+            _ss_hib = dict(session_state)
+            # Complementar con datos específicos del híbrido si están disponibles
+            if "_hib_v_bat" in session_state:
+                _ss_hib.setdefault("calc_vdc",       session_state.get("_hib_v_bat", 48))
+            if "hib_isc" in session_state:
+                _ss_hib.setdefault("calc_isc",        session_state.get("hib_isc", 8.02))
+            if "hib_nstr" in session_state:
+                _ss_hib.setdefault("calc_paralelo",   session_state.get("hib_nstr", 1))
+            _mostrar_cableado_hib(proyecto_id, _ss_hib)
+        else:
+            st.warning("⚠ El módulo de cableado no está disponible. Verifica que modulo_cableado.py esté en el mismo directorio.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # INFORME COMPLETO DE SOPORTE — PDF CONSOLIDADO HÍBRIDO
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("<hr class='sep' style='margin:2rem 0 1rem;'>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class='sol-card-title'>📄 INFORME COMPLETO DE SOPORTE DEL PROYECTO</div>
+    <div class='info-note'>
+        Genera <b>un solo PDF</b> con todo el dimensionamiento HÍBRIDO: cargas y/o recibo,
+        dimensionamiento del array, banco de baterías e inversor híbrido,
+        <b>plano de paneles</b> y <b>diagrama unifilar</b>, análisis económico-ambiental
+        y la memoria técnica de <b>cableado</b> (RETIE/IEC) — listo como soporte de lo realizado.
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not _INFORME_COMPLETO_HIB:
+        st.warning(f"⚠ El módulo de informe completo no está disponible: **{_INFORME_COMPLETO_HIB_ERROR}**. "
+                   "Verifica que `modulo_informe.py` esté en el mismo directorio y que estén instaladas "
+                   "sus dependencias: `pip install svglib pypdf reportlab`.")
+    else:
+        if st.button("📄 Generar Informe Completo (PDF)", use_container_width=True,
+                     key="btn_informe_completo_hibrido"):
+            session_state["_gen_informe_completo_hib"] = True
+
+        if session_state.get("_gen_informe_completo_hib", False):
+            with st.spinner("Consolidando informe completo — reuniendo todas las secciones..."):
+                try:
+                    nombre_inf_hib    = _proy_nombre
+                    municipio_inf_hib = p_info[2] if p_info and len(p_info) > 2 else "—"
+
+                    partes_hib              = []
+                    secciones_incluidas_hib = []
+                    avisos_hib              = []
+
+                    # 1· Dimensionamiento técnico HÍBRIDO (array + baterías + inversor)
+                    try:
+                        if "_datos_pdf_hib" in dir() and _datos_pdf_hib:
+                            partes_hib.append(generar_pdf_hibrido(proyecto_id, p_info, _datos_pdf_hib))
+                            secciones_incluidas_hib.append("Dimensionamiento técnico HÍBRIDO")
+                        else:
+                            avisos_hib.append("Dimensionamiento técnico: visita la pestaña de "
+                                               "dimensionamiento y calcula el array/baterías/inversor.")
+                    except Exception as e:
+                        avisos_hib.append(f"Dimensionamiento técnico: {e}")
+
+                    # 2· Plano de paneles
+                    try:
+                        if "svg7" in dir():
+                            partes_hib.append(svg_a_pdf_bytes(svg7))
+                            secciones_incluidas_hib.append("Plano de distribución de paneles")
+                        else:
+                            avisos_hib.append("Plano de paneles: visita la pestaña de plano de paneles.")
+                    except Exception as e:
+                        avisos_hib.append(f"Plano de paneles: {e}")
+
+                    # 3· Diagrama unifilar
+                    try:
+                        if "svg8" in dir():
+                            partes_hib.append(svg_a_pdf_bytes(svg8))
+                            secciones_incluidas_hib.append("Diagrama unifilar HÍBRIDO")
+                        else:
+                            avisos_hib.append("Diagrama unifilar: visita la pestaña de diagrama unifilar.")
+                    except Exception as e:
+                        avisos_hib.append(f"Diagrama unifilar: {e}")
+
+                    # 4· Análisis económico y ambiental
+                    try:
+                        if "_datos_pdf_eco_h" in dir() and _datos_pdf_eco_h:
+                            partes_hib.append(generar_pdf_economico_hibrido(
+                                proyecto_id, p_info, _datos_pdf_eco_h))
+                            secciones_incluidas_hib.append("Análisis económico y ambiental")
+                        else:
+                            avisos_hib.append("Análisis económico: visita la pestaña económica.")
+                    except Exception as e:
+                        avisos_hib.append(f"Análisis económico: {e}")
+
+                    # 5· Cableado
+                    try:
+                        _tramos_hib = session_state.get("_cableado_tramos")
+                        _params_hib = session_state.get("_cableado_params")
+                        if _tramos_hib and _params_hib:
+                            partes_hib.append(_generar_pdf_cableado_hib(
+                                tramos=_tramos_hib, params=_params_hib,
+                                proyecto_nombre=nombre_inf_hib, proyecto_municipio=municipio_inf_hib))
+                            secciones_incluidas_hib.append("Memoria técnica de cableado (RETIE/IEC)")
+                        else:
+                            avisos_hib.append("Cableado: visita la pestaña de cableado para calcularlo.")
+                    except Exception as e:
+                        avisos_hib.append(f"Cableado: {e}")
+
+                    portada_hib = pagina_portada(nombre_inf_hib, municipio_inf_hib, "HIBRIDO",
+                                                  secciones_incluidas_hib)
+                    partes_hib.insert(0, portada_hib)
+
+                    pdf_final_hib = combinar_pdfs(partes_hib)
+                    fname_inf_hib = (f"Informe_Completo_HIBRIDO_{nombre_inf_hib.replace(' ','_')}_"
+                                     f"{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
+
+                    if avisos_hib:
+                        st.markdown(
+                            "<div class='warn-box'>⚠ Algunas secciones no se incluyeron:<br>• " +
+                            "<br>• ".join(avisos_hib) + "</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='info-note'>✅ Informe generado con "
+                        f"<b>{len(secciones_incluidas_hib)}</b> secciones: "
+                        f"{', '.join(secciones_incluidas_hib) if secciones_incluidas_hib else '—'}</div>",
+                        unsafe_allow_html=True)
+                    st.download_button(
+                        "⬇ Descargar Informe Completo PDF", data=pdf_final_hib,
+                        file_name=fname_inf_hib, mime="application/pdf",
+                        use_container_width=True, key="dl_informe_completo_hibrido")
+                    session_state["_gen_informe_completo_hib"] = False
+                except Exception as e:
+                    st.error(f"Error generando el informe completo: {e}")
+                    session_state["_gen_informe_completo_hib"] = False
+
+    # Footer
+    st.markdown("""
+    <div style='text-align:center;padding:2rem 0 1rem;color:#2A3A55;font-size:0.75rem;letter-spacing:2px;'>
+        CALCULADORA SOLAR · SISTEMA FOTOVOLTAICO HÍBRIDO · CREG 030-2018 · RETIE · NTC 2050
+    </div>""", unsafe_allow_html=True)
